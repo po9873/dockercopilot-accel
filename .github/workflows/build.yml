@@ -1,0 +1,127 @@
+name: build-with-accelerator
+
+# 仅在「上游 l429609201/dockerCopilot 真正更新」时才重新打包：
+# 由 watch-upstream.yml 巡检发现上游 HEAD 变化后发 repository_dispatch(upstream-updated) 触发本流程；
+# 也支持在 Actions 页面手动 Run workflow 立即构建。
+#
+# 用本仓库的 auth.go（含 Docker Hub 加速站支持）覆盖上游同名文件、
+# 用 patch_attribution.py 把镜像内维护者署名改为 po9873（原作者 onlyLTY · DongShu 署名保留）。
+#
+# Docker Hub 推送需要在仓库 Settings → Secrets → Actions 配置：
+#   DOCKERHUB_USERNAME  Docker Hub 用户名
+#   DOCKERHUB_TOKEN     Docker Hub 访问令牌（hub.docker.com → 账户设置 → Security → Personal access tokens）
+# 未配置时自动跳过 Docker Hub，仅推 GHCR。
+on:
+  repository_dispatch:
+    types: [upstream-updated]
+  workflow_dispatch: # 支持在 Actions 页面手动点 Run workflow 立即构建
+
+concurrency:
+  group: build-accel
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: l429609201/dockerCopilot
+  UPSTREAM_BRANCH: main
+  DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+  DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # 1. 检出本仓库（根目录放着打好加速站补丁的 auth.go）
+      - name: Checkout this repo (patch overlay)
+        uses: actions/checkout@v4
+
+      # 2. 检出上游 dockerCopilot 最新代码
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_BRANCH }}
+          path: upstream
+
+      # 3. 叠加补丁：直接覆盖上游同名文件。
+      #    若上游重构了 internal/module/auth.go，编译会失败并邮件通知，
+      #    把上游新版 auth.go 拿来重新套补丁更新本仓库文件即可。
+      - name: Overlay accelerator patch
+        run: |
+          set -euo pipefail
+          cp auth.go upstream/internal/module/auth.go
+
+      # 3.5 署名补丁：把镜像内 DockerCopilot 的维护者身份从 l429609201
+      #     改为 po9873（原作者 onlyLTY · DongShu 署名保留）。
+      #     涉及侧边栏团队信息、镜像 LABEL、关于页链接、自身容器图标识别。
+      #     上游结构变动导致匹配失败时构建会失败并提示更新脚本。
+      - name: Overlay attribution patch
+        run: |
+          set -euo pipefail
+          python3 patch_attribution.py
+
+      - name: Prepare version info
+        run: |
+          set -euo pipefail
+          # 版本号严格沿用上游 version 文件，不再附加 accel.N 后缀。
+          # 加速站是构建补丁，不应改变 DockerCopilot 的程序版本号。
+          BASE_VERSION=$(tr -d ' \n\r\t' < upstream/version)
+          echo "VERSION=${BASE_VERSION}" >> $GITHUB_ENV
+          echo "UPSTREAM_SHA=$(cd upstream && git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      # 4. 只发布 latest，避免再产生带 accel 后缀的镜像标签
+      - name: Compute image tags
+        run: |
+          set -euo pipefail
+          TAGS="ghcr.io/${{ github.repository_owner }}/dockercopilot-accel:latest"
+          if [ -n "$DH_USER" ] && [ -n "$DH_TOKEN" ]; then
+            TAGS="${TAGS}"$'\n'"docker.io/${DH_USER}/dockercopilot:latest"
+            echo "将同时推送到 Docker Hub: ${DH_USER}/dockercopilot:latest"
+          else
+            echo "未配置 DOCKERHUB_USERNAME/DOCKERHUB_TOKEN secret，本次仅推送 GHCR"
+          fi
+          {
+            echo 'TAGS<<EOF'
+            echo "$TAGS"
+            echo 'EOF'
+          } >> $GITHUB_ENV
+
+      # 5. 多架构构建（amd64 + arm64）。
+      #    该 Dockerfile 的前端/Go 编译阶段固定在构建机原生架构交叉编译，
+      #    只有运行时 alpine 阶段需要 QEMU，整体构建时间可控。
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        if: env.DH_USER != '' && env.DH_TOKEN != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: upstream/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.TAGS }}
+          build-args: |
+            VERSION=${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.revision=${{ env.UPSTREAM_SHA }}
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}

@@ -1,0 +1,69 @@
+name: watch-upstream
+
+# 轻量巡检：每天（北京时间 04:40）取上游 l429609201/dockerCopilot 的 main HEAD SHA，
+# 与仓库变量 UPSTREAM_LAST_SHA 比较。
+#   - 无变化：本次什么都不做（不触发打包）。
+#   - 有变化：发 repository_dispatch(upstream-updated) 触发 build-with-accelerator 重新打包，并写入新 SHA。
+# 因此真正的多架构打包只在「上游确实更新」时才发生，不再每天空跑。
+#
+# 也支持在 Actions 页面手动 Run workflow 立即检查一次（手动跑始终重新比对，仅在变化时派发）。
+on:
+  schedule:
+    - cron: '40 20 * * *'   # UTC 20:40 = 北京时间每天 04:40
+  workflow_dispatch:
+
+permissions:
+  actions: write   # 用于 gh variable set 写入上游 SHA
+
+env:
+  UPSTREAM_REPO: l429609201/dockerCopilot
+  UPSTREAM_BRANCH: main
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve upstream HEAD SHA
+        id: upstream
+        run: |
+          set -euo pipefail
+          SHA=$(gh api "repos/${{ env.UPSTREAM_REPO }}/git/ref/heads/${{ env.UPSTREAM_BRANCH }}" --jq '.object.sha')
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "上游 ${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }} HEAD = ${SHA}"
+
+      - name: Compare with last built SHA
+        id: check
+        env:
+          LAST: ${{ vars.UPSTREAM_LAST_SHA }}
+          SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$LAST" = "$SHA" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "上游无变化（${SHA}），跳过"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "上游有变化：${LAST:-（首次/未记录）} → ${SHA}"
+
+      - name: Dispatch build to build-with-accelerator
+        if: steps.check.outputs.changed == 'true'
+        env:
+          SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/dispatches" \
+            -f "event_type=upstream-updated" \
+            -f "client_payload[sha]=${SHA}"
+
+      - name: Save upstream SHA
+        if: steps.check.outputs.changed == 'true'
+        env:
+          SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh variable set UPSTREAM_LAST_SHA --body "$SHA"
+          echo "已记录上游 SHA：${SHA}"
