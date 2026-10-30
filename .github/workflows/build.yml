@@ -19,6 +19,8 @@ on:
   repository_dispatch:
     types: [upstream-updated]
   workflow_dispatch: # 支持在 Actions 页面手动点 Run workflow 立即构建
+  push:
+    branches: [main] # 补丁更新推送到 main 时自动重建（API dispatch 在部分网络下不可用）
 
 concurrency:
   group: build-accel
