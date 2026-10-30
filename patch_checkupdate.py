@@ -30,9 +30,12 @@ REPLACEMENT = """		remoteDigest, err = GetDigest(digestURL, token)
 		if err != nil {
 """
 
-# BuildManifestURL 中 manifest URL 的 scheme 原来写死 https；
-# GetRegistryAddress 现在可能返回带 "http://" 前缀的 target
-# （hubURL=http://... 指向自建内网 pull-through 缓存），需要跟随。
+# BuildManifestURL 中 manifest URL 的 scheme 原来写死 https、host 直接填
+# GetRegistryAddress 的返回值。而后者的返回值可能是带 scheme 的完整 target
+# （hubURL=https://registry.linkease.net:5443 时归一为 "https://host:port"），
+# 直接填进 url.URL.Host 会被转义成 "https:%2F%2F..."，导致 parse:
+# invalid URL escape "%2F"，所有镜像检测失败。因此这里必须同时剥离
+# http:// 与 https:// 两种前缀，取真正的 host[:port]。
 URL_ANCHOR = """	url := url2.URL{
 		Scheme: "https",
 		Host:   host,
@@ -44,6 +47,9 @@ URL_REPLACEMENT = """	scheme := "https"
 	addr := host
 	if s, ok := strings.CutPrefix(host, "http://"); ok {
 		scheme, addr = "http", s
+	} else if s, ok := strings.CutPrefix(host, "https://"); ok {
+		// hubURL 归一后带 https:// 前缀，必须剥掉，否则 // 会被转义为 %2F
+		scheme, addr = "https", s
 	}
 	url := url2.URL{
 		Scheme: scheme,
