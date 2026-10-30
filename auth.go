@@ -154,12 +154,7 @@ func GetAuthURL(challenge string, imageRef ref.Named) (*url.URL, error) {
 func GetChallengeURL(imageRef ref.Named) url.URL {
 	host, _ := GetRegistryAddress(imageRef.Name())
 
-	URL := url.URL{
-		Scheme: "https",
-		Host:   host,
-		Path:   "/v2/",
-	}
-	return URL
+	return hubTargetURL(host, "/v2/")
 }
 
 // DefaultAcceleratorHostList Docker Hub（docker.io）官方镜像的加速站候选列表，
@@ -221,8 +216,9 @@ func resolveHubHost() string {
 	return acceleratorHost
 }
 
-// normalizeHubURL 把 hubURL 取值归一为 host[:port]，
-// 兼容带/不带 scheme、带尾路径等写法；非法值返回空串并回退自动探测。
+// normalizeHubURL 把 hubURL 取值归一为 target（"scheme://host[:port]"），
+// 兼容带/不带 scheme、带尾路径等写法；省略 scheme 时默认 https；
+// 支持 http://（自建内网 pull-through 缓存等明文 registry）；非法值返回空串。
 func normalizeHubURL(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -235,7 +231,24 @@ func normalizeHubURL(raw string) string {
 	if err != nil || u.Host == "" {
 		return ""
 	}
-	return u.Host
+	return u.Scheme + "://" + u.Host
+}
+
+// hubTargetURL 由 target（"scheme://host[:port]"，省略 scheme 视为 https）
+// 构造请求 URL。hubURL 允许 http://，用于自建内网 registry（如 registry:2
+// pull-through 缓存），这类服务通常不做 TLS。
+func hubTargetURL(target, path string) url.URL {
+	scheme, addr := "https", target
+	if t, ok := strings.CutPrefix(target, "http://"); ok {
+		scheme, addr = "http", t
+	} else if t, ok := strings.CutPrefix(target, "https://"); ok {
+		addr = t
+	}
+	return url.URL{
+		Scheme: scheme,
+		Host:   addr,
+		Path:   path,
+	}
 }
 
 // checkHost 探测 registry /v2/ 端点是否可达（200/401 均视为可用）。
@@ -345,12 +358,7 @@ func buildManifestURLForHost(host string, image types.Image) (string, error) {
 	if !isTagged {
 		return "", errors.New("镜像无tag" + normalizedRef.String())
 	}
-	u := url.URL{
-		Scheme: "https",
-		Host:   host,
-		Path:   fmt.Sprintf("/v2/%s/manifests/%s", ref.Path(tagged), tagged.Tag()),
-	}
-	return u.String(), nil
+	return hubTargetURL(host, fmt.Sprintf("/v2/%s/manifests/%s", ref.Path(tagged), tagged.Tag())).String(), nil
 }
 
 // GetTokenForHost 与 GetToken 等价，但允许显式指定 registry host。
@@ -361,11 +369,7 @@ func GetTokenForHost(host string, image types.Image, registryAuth string) (strin
 		return "", err
 	}
 
-	URL := url.URL{
-		Scheme: "https",
-		Host:   host,
-		Path:   "/v2/",
-	}
+	URL := hubTargetURL(host, "/v2/")
 
 	req, err := GetChallengeRequest(URL)
 	if err != nil {

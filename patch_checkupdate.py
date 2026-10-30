@@ -31,6 +31,40 @@ REPLACEMENT = """		remoteDigest, err = GetDigest(digestURL, token)
 		if err != nil {
 """
 
+# BuildManifestURL 中 manifest URL 的 scheme 原来写死 https；
+# GetRegistryAddress 现在可能返回带 "http://" 前缀的 target
+# （hubURL=http://... 指向自建内网 pull-through 缓存），需要跟随。
+URL_ANCHOR = """	url := url2.URL{
+		Scheme: "https",
+		Host:   host,
+		Path:   fmt.Sprintf("/v2/%s/manifests/%s", img, tag),
+	}
+"""
+
+URL_REPLACEMENT = """	scheme := "https"
+	addr := host
+	if s, ok := strings.CutPrefix(host, "http://"); ok {
+		scheme, addr = "http", s
+	}
+	url := url2.URL{
+		Scheme: scheme,
+		Host:   addr,
+		Path:   fmt.Sprintf("/v2/%s/manifests/%s", img, tag),
+	}
+"""
+
+
+def apply(text: str, anchor: str, replacement: str, name: str) -> str:
+    count = text.count(anchor)
+    if count != 1:
+        print(
+            f"[patch_checkupdate] 锚点 {name} 匹配到 {count} 次（期望 1 次），"
+            "上游 checkupdate.go 可能已重构，请手动核对后更新本脚本",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return text.replace(anchor, replacement)
+
 
 def main() -> int:
     if not TARGET.exists():
@@ -38,17 +72,10 @@ def main() -> int:
         return 1
 
     text = TARGET.read_text(encoding="utf-8")
-    count = text.count(ANCHOR)
-    if count != 1:
-        print(
-            f"[patch_checkupdate] 锚点匹配到 {count} 次（期望 1 次），"
-            "上游 checkupdate.go 可能已重构，请手动核对后更新本脚本",
-            file=sys.stderr,
-        )
-        return 1
-
-    TARGET.write_text(text.replace(ANCHOR, REPLACEMENT), encoding="utf-8")
-    print("[patch_checkupdate] checkupdate.go 兜底重试补丁已应用")
+    text = apply(text, ANCHOR, REPLACEMENT, "fallback-retry")
+    text = apply(text, URL_ANCHOR, URL_REPLACEMENT, "manifest-url-scheme")
+    TARGET.write_text(text, encoding="utf-8")
+    print("[patch_checkupdate] checkupdate.go 兜底重试 + http scheme 补丁已应用")
     return 0
 
 
