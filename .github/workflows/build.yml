@@ -4,8 +4,12 @@ name: build-with-accelerator
 # 由 watch-upstream.yml 巡检发现上游 HEAD 变化后发 repository_dispatch(upstream-updated) 触发本流程；
 # 也支持在 Actions 页面手动 Run workflow 立即构建。
 #
-# 用本仓库的 auth.go（含 Docker Hub 加速站支持）覆盖上游同名文件、
-# 用 patch_attribution.py 把镜像内维护者署名改为 po9873（原作者 onlyLTY · DongShu 署名保留）。
+# 补丁内容：
+#   1. 用本仓库的 auth.go（含 Docker Hub 加速站 + 兜底机制）覆盖上游同名文件；
+#   2. 用 patch_checkupdate.py 在上游 checkupdate.go 的 digest 获取失败分支
+#      插入「兜底加速站重试」，解决部分加速站（如 linkease/iStoreOS 本地缓存）
+#      只覆盖已缓存仓库、未缓存仓库 403/525 导致"检测不到更新"的问题；
+#   3. 用 patch_attribution.py 把镜像内维护者署名改为 po9873（原作者 onlyLTY · DongShu 署名保留）。
 #
 # Docker Hub 推送需要在仓库 Settings → Secrets → Actions 配置：
 #   DOCKERHUB_USERNAME  Docker Hub 用户名
@@ -53,6 +57,14 @@ jobs:
         run: |
           set -euo pipefail
           cp auth.go upstream/internal/module/auth.go
+
+      # 3.2 兜底重试补丁：在 checkupdate.go 的 GetDigest 失败分支插入
+      #     兜底加速站重试逻辑（与 auth.go 的 FetchDigestViaFallback 配合）。
+      #     锚点未命中（上游重构）时脚本以非零码退出，构建失败并通知。
+      - name: Overlay checkupdate fallback patch
+        run: |
+          set -euo pipefail
+          python3 patch_checkupdate.py
 
       # 3.5 署名补丁：把镜像内 DockerCopilot 的维护者身份从 l429609201
       #     改为 po9873（原作者 onlyLTY · DongShu 署名保留）。
