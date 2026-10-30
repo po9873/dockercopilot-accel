@@ -2,7 +2,6 @@ package module
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	ref "github.com/distribution/reference"
 	"github.com/l429609201/dockerCopilot/internal/types"
@@ -300,123 +299,6 @@ loop:
 		return ""
 	}
 	return hosts[best]
-}
-
-// ---------------------------------------------------------------------------
-// 兜底加速站：hubURL 指定的镜像加速站可能只覆盖部分仓库（如 iStoreOS/linkease
-// 本地缓存服务对未缓存仓库返回 403/525）。对这些仓库，更新检查通过
-// FetchDigestViaFallback 用兜底源重试，避免检测结果全部落入「未知」。
-// ---------------------------------------------------------------------------
-
-var (
-	fallbackOnce      sync.Once
-	fallbackHostValue string
-)
-
-// FallbackHubHost 决定兜底 digest 请求使用的 host：
-//  1. 可用 hubFALLBACK_URL 环境变量显式指定（如与主加速站不同的另一个站）；
-//  2. 否则并行探测内置加速站列表，取列表顺序最靠前的可用者；
-//  3. 全部不可用则回退源站 index.docker.io（海外环境可直接命中）。
-//
-// 结果经 sync.Once 缓存，进程生命周期内保持不变。
-func FallbackHubHost() string {
-	fallbackOnce.Do(func() {
-		if host := normalizeHubURL(os.Getenv("hubFALLBACK_URL")); host != "" {
-			fallbackHostValue = host
-			logx.Infof("hubFALLBACK_URL 已配置，兜底 digest 检查走: %s", host)
-			return
-		}
-		if host := probeFirstReachable(DefaultAcceleratorHostList); host != "" {
-			fallbackHostValue = host
-			logx.Infof("兜底 digest 检查走加速站: %s", host)
-			return
-		}
-		fallbackHostValue = DefaultRegistryHost
-		logx.Infof("全部加速站不可用，兜底 digest 检查回退源站: %s", DefaultRegistryHost)
-	})
-	return fallbackHostValue
-}
-
-// IsDockerHubImage 判断镜像是否属于 Docker Hub（镜像名无显式 registry 前缀）。
-// 只有 Docker Hub 镜像才需要加速站兜底；ghcr.io 等其他 registry 不适用。
-func IsDockerHubImage(image types.Image) bool {
-	normalizedRef, err := ref.ParseNormalizedNamed(image.ImageName)
-	if err != nil {
-		return false
-	}
-	return ref.Domain(normalizedRef) == DefaultRegistryDomain
-}
-
-// buildManifestURLForHost 与 checkupdate.go 的 BuildManifestURL 等价，
-// 但允许显式指定 registry host（供兜底请求使用）。
-func buildManifestURLForHost(host string, image types.Image) (string, error) {
-	normalizedRef, err := ref.ParseDockerRef(image.ImageName + ":" + image.ImageTag)
-	if err != nil {
-		return "", err
-	}
-	tagged, isTagged := normalizedRef.(ref.NamedTagged)
-	if !isTagged {
-		return "", errors.New("镜像无tag" + normalizedRef.String())
-	}
-	return hubTargetURL(host, fmt.Sprintf("/v2/%s/manifests/%s", ref.Path(tagged), tagged.Tag())).String(), nil
-}
-
-// GetTokenForHost 与 GetToken 等价，但允许显式指定 registry host。
-// 用于兜底源：主加速站与兜底站的鉴权挑战流程各自独立。
-func GetTokenForHost(host string, image types.Image, registryAuth string) (string, error) {
-	normalizedRef, err := ref.ParseNormalizedNamed(image.ImageName)
-	if err != nil {
-		return "", err
-	}
-
-	URL := hubTargetURL(host, "/v2/")
-
-	req, err := GetChallengeRequest(URL)
-	if err != nil {
-		return "", err
-	}
-
-	client := &http.Client{Timeout: authHTTPTimeout}
-	res, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			logx.Error("GetTokenForHost关闭Body失败" + err.Error())
-		}
-	}(res.Body)
-
-	challenge := strings.ToLower(res.Header.Get(ChallengeHeader))
-	if strings.HasPrefix(challenge, "basic") {
-		if registryAuth == "" {
-			return "", fmt.Errorf("no credentials available")
-		}
-		return fmt.Sprintf("Basic %s", registryAuth), nil
-	}
-	if strings.HasPrefix(challenge, "bearer") {
-		return GetBearerHeader(challenge, normalizedRef, registryAuth)
-	}
-	// 免鉴权 registry：匿名请求即可
-	return "", nil
-}
-
-// FetchDigestViaFallback 用兜底加速站获取指定镜像的最新 manifest digest。
-// 由 checkupdate.go 的 checkSingleImage 在主加速站回源失败时调用。
-func FetchDigestViaFallback(image types.Image) (string, error) {
-	host := FallbackHubHost()
-	digestURL, err := buildManifestURLForHost(host, image)
-	if err != nil {
-		return "", err
-	}
-	token, err := GetTokenForHost(host, image, "")
-	if err != nil {
-		// 拿不到 token 时按匿名方式尝试（部分站无需鉴权）
-		logx.Debugf("兜底源获取 token 失败，按匿名重试 [%s]: %v", image.ImageName, err)
-		token = ""
-	}
-	return GetDigest(digestURL, token)
 }
 
 // GetRegistryAddress 解析镜像引用所属的 registry 地址。

@@ -60,10 +60,10 @@ jobs:
           set -euo pipefail
           cp auth.go upstream/internal/module/auth.go
 
-      # 3.2 兜底重试补丁：在 checkupdate.go 的 GetDigest 失败分支插入
-      #     兜底加速站重试逻辑（与 auth.go 的 FetchDigestViaFallback 配合）。
-      #     锚点未命中（上游重构）时脚本以非零码退出，构建失败并通知。
-      - name: Overlay checkupdate fallback patch
+      # 3.2 同站重试补丁：在 checkupdate.go 的 GetDigest 失败分支插入
+      #     同一 URL 重试逻辑（不依赖第三方加速站）。锚点未命中（上游
+      #     重构）时脚本以非零码退出，构建失败并通知。
+      - name: Overlay checkupdate retry patch
         run: |
           set -euo pipefail
           python3 patch_checkupdate.py

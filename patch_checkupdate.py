@@ -2,8 +2,9 @@
 """对上游 l429609201/dockerCopilot 的 internal/module/checkupdate.go 打补丁。
 
 在 checkSingleImage 中 GetDigest 失败（或返回空 digest）之后插入
-「Docker Hub 镜像走兜底加速站重试」的逻辑，与 auth.go 中新增的
-FetchDigestViaFallback / IsDockerHubImage 配合使用。
+「同一加速站 URL 重试」的逻辑：部分加速站（如 KSpeeder）把请求随机
+分发到多个上游节点，其中个别节点故障时表现为 525/403，重试同一 URL
+往往能命中健康节点。不依赖任何第三方加速站。
 
 锚点不唯一或未命中时以非零码退出，让构建失败并通知维护者（与
 overlay 补丁的重构告警策略一致），避免静默打出无效镜像。
@@ -19,14 +20,12 @@ ANCHOR = """		remoteDigest, err = GetDigest(digestURL, token)
 """
 
 REPLACEMENT = """		remoteDigest, err = GetDigest(digestURL, token)
-		// 加速站兜底：部分加速站只覆盖已缓存的仓库（未缓存仓库返回 403/525
-		// 或 200 但无 digest），对 Docker Hub 镜像在主加速站失败时改走兜底
-		// 加速站重试一次，避免这类镜像的检测结果全部落入「未知」。
-		if (err != nil || remoteDigest == "") && IsDockerHubImage(image) {
-			if altDigest, altErr := FetchDigestViaFallback(image); altErr == nil && altDigest != "" {
-				logx.Infof("加速站回源失败，已通过兜底源获取 digest [%s]", imageRef)
-				remoteDigest, err = altDigest, nil
-			}
+		// 加速站重试：部分加速站把请求随机分发到多个上游节点，个别节点
+		// 故障时表现为 525/403/空 digest，重试同一 URL 通常能命中健康节点。
+		// 最多额外重试 3 次，退避间隔递增，全部失败才放弃。
+		for retry := 0; retry < 3 && (err != nil || remoteDigest == ""); retry++ {
+			time.Sleep(time.Duration(300*(retry+1)) * time.Millisecond)
+			remoteDigest, err = GetDigest(digestURL, token)
 		}
 		if err != nil {
 """
@@ -75,7 +74,7 @@ def main() -> int:
     text = apply(text, ANCHOR, REPLACEMENT, "fallback-retry")
     text = apply(text, URL_ANCHOR, URL_REPLACEMENT, "manifest-url-scheme")
     TARGET.write_text(text, encoding="utf-8")
-    print("[patch_checkupdate] checkupdate.go 兜底重试 + http scheme 补丁已应用")
+    print("[patch_checkupdate] checkupdate.go 同站重试 + http scheme 补丁已应用")
     return 0
 
 
