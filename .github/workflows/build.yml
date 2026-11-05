@@ -13,7 +13,9 @@ name: build-with-accelerator
 #      开关上，未开 TG 时界面快照永不刷新：检不出新版 / 一直误报有更新）；
 #   4. 用 patch_taskcenter.py 把任务中心「清除已完成」持久化到 localStorage，
 #      避免刷新页面后 SSE 把后端仍保留的全量任务重新推回来；
-#   5. 用 patch_attribution.py 把镜像内维护者署名改为 po9873（原作者 onlyLTY · DongShu 署名保留）。
+#   5. 用 patch_pullviahub.py 让点「更新」时的镜像拉取也走同一个自建加速站，
+#      并在拉取前强制刷新该站 manifest 缓存；不碰宿主机 daemon 配置；
+#   6. 用 patch_attribution.py 把镜像内维护者署名改为 po9873（原作者 onlyLTY · DongShu 署名保留）。
 #
 # Docker Hub 推送需要在仓库 Settings → Secrets → Actions 配置：
 #   DOCKERHUB_USERNAME  Docker Hub 用户名
@@ -95,7 +97,16 @@ jobs:
           set -euo pipefail
           python3 patch_cachelag.py
 
-      # 3.6 署名补丁：把镜像内 DockerCopilot 的维护者身份从 l429609201
+      # 3.6 拉取链路改走自建加速站：上游 ImagePull 传原始镜像名，请求由宿主机
+      #     daemon 直连 registry-1.docker.io，完全绕过 hubURL，导致"检测到更新
+      #     却拉不动"。补丁把 Docker Hub 镜像改写为 hubURL 前缀、拉完 tag 回原名，
+      #     并覆盖 DC 自更新的第二处 ImagePull；拉取前调用自建站 force=1 清缓存。
+      - name: Overlay pull-via-hub patch
+        run: |
+          set -euo pipefail
+          python3 patch_pullviahub.py
+
+      # 3.7 署名补丁：把镜像内 DockerCopilot 的维护者身份从 l429609201
       #     改为 po9873（原作者 onlyLTY · DongShu 署名保留）。
       #     涉及侧边栏团队信息、镜像 LABEL、关于页链接、自身容器图标识别。
       #     上游结构变动导致匹配失败时构建会失败并提示更新脚本。
