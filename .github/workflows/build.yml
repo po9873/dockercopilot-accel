@@ -86,7 +86,16 @@ jobs:
           set -euo pipefail
           python3 patch_taskcenter.py
 
-      # 3.5 署名补丁：把镜像内 DockerCopilot 的维护者身份从 l429609201
+      # 3.5 加速站 manifest 缓存滞后抑制：KSpeeder 等自建缓存的 TTL 不可调，
+      #     缓存里的旧 digest 与刚更新的本地镜像永远不相等，导致「更新完又提示」。
+      #     按镜像引用记录本地/远端 digest，状态持久化到 /data，远端 digest
+      #     变化时才恢复判定。不依赖第三方、不碰代理、不改宿主机配置。
+      - name: Overlay cache-lag suppression patch
+        run: |
+          set -euo pipefail
+          python3 patch_cachelag.py
+
+      # 3.6 署名补丁：把镜像内 DockerCopilot 的维护者身份从 l429609201
       #     改为 po9873（原作者 onlyLTY · DongShu 署名保留）。
       #     涉及侧边栏团队信息、镜像 LABEL、关于页链接、自身容器图标识别。
       #     上游结构变动导致匹配失败时构建会失败并提示更新脚本。
