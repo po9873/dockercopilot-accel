@@ -200,6 +200,9 @@ func IsStaleRemoteManifest(manifestURL, remoteDigest, token string, localCreated
     if !e.ok {
         // 远端数据不可验证时不报更新。不是永久抑制：60 秒后重试，
         // 加速站恢复且远端确实更新时照常报出。
+        // 同时立刻让当前加速站选择失效：上游回源超时往往是整站问题，
+        // 下一轮检测会重新探测并切到备站，不必等满 60 秒。
+        hubcfg.Invalidate()
         return true, "远端构建时间不可验证（加速站数据不完整），暂不报更新"
     }
     if e.created.Unix() > localCreated {

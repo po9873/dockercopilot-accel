@@ -8,6 +8,8 @@ name: build-with-accelerator
 #   1. 用本仓库的 auth.go 覆盖上游同名文件 + 新增 hubcfg 包：检测只走镜像
 #      自身声明的源站，不引入任何第三方加速站或兜底；hubURL 可填多个自建站
 #      （逗号/分号/空格分隔），按主备顺序选第一个可达者，不轮询、不冲突；
+#      健康探测用真实 manifest GET（library/nginx，5s 超时，校验 200+digest+JSON），
+#      因为自建站 /v2/ 在上游回源卡死时仍秒回 200，只有 manifest 能识别上游超时；
 #   2. 用 patch_checkupdate.py 修复 BuildManifestURL 的 scheme 拼接，并给
 #      digest 获取加同 URL 重试（300/600/900ms 退避）；
 #   3. 用 patch_scheduler.py 让定时检测始终执行（上游把检测绑死在 Telegram
@@ -21,6 +23,8 @@ name: build-with-accelerator
 #      沿同一自建站链路取远端镜像 config 的 created，不晚于本地则判为旧缓存、
 #      不报更新；远端构建时间取不到（403/429/超时，加速站数据不可信）同样不报，
 #      60 秒后重试，不是永久抑制；确实更新则正常报出（hubStaleCheck=off 可关）；
+#      取不到时同时调用 hubcfg.Invalidate() 让当前站选择立即失效，下一轮检测
+#      就重新探测并切备站，不必等满 60 秒 TTL（30 秒内最多触发一次）；
 #   6. 用 patch_pullviahub.py 让点「更新」时的镜像拉取也走同一个自建加速站，
 #      含带显式域名的官方站镜像（避免 100 次/小时/IP 限流导致拉不动），
 #      并在拉取前强制刷新该站 manifest 缓存；不碰宿主机 daemon 配置；
