@@ -5,8 +5,9 @@ name: build-with-accelerator
 # 也支持在 Actions 页面手动 Run workflow 立即构建。
 #
 # 补丁内容：
-#   1. 用本仓库的 auth.go 覆盖上游同名文件：检测只走镜像自身声明的源站，
-#      不引入任何第三方加速站或兜底；
+#   1. 用本仓库的 auth.go 覆盖上游同名文件 + 新增 hubcfg 包：检测只走镜像
+#      自身声明的源站，不引入任何第三方加速站或兜底；hubURL 可填多个自建站
+#      （逗号/分号/空格分隔），按主备顺序选第一个可达者，不轮询、不冲突；
 #   2. 用 patch_checkupdate.py 修复 BuildManifestURL 的 scheme 拼接，并给
 #      digest 获取加同 URL 重试（300/600/900ms 退避）；
 #   3. 用 patch_scheduler.py 让定时检测始终执行（上游把检测绑死在 Telegram
@@ -18,7 +19,8 @@ name: build-with-accelerator
 #      不使用任何抑制状态，真更新不会被压掉；
 #      另外识别「上游节点池长期缓存几天前旧 index（STALE）」：复查后仍不一致时
 #      沿同一自建站链路取远端镜像 config 的 created，不晚于本地则判为旧缓存、
-#      不报更新；取不到或确实更新时保持原判定（hubStaleCheck=off 可关）；
+#      不报更新；远端构建时间取不到（403/429/超时，加速站数据不可信）同样不报，
+#      60 秒后重试，不是永久抑制；确实更新则正常报出（hubStaleCheck=off 可关）；
 #   6. 用 patch_pullviahub.py 让点「更新」时的镜像拉取也走同一个自建加速站，
 #      含带显式域名的官方站镜像（避免 100 次/小时/IP 限流导致拉不动），
 #      并在拉取前强制刷新该站 manifest 缓存；不碰宿主机 daemon 配置；
@@ -72,6 +74,10 @@ jobs:
         run: |
           set -euo pipefail
           cp auth.go upstream/internal/module/auth.go
+          # hubcfg 是独立包：hubURL 支持多个自建加速站（按配置顺序主备，
+          # 同一时刻只用一个），检测 / 拉取 / 清缓存三处共用当前站。
+          mkdir -p upstream/internal/hubcfg
+          cp hubcfg.go upstream/internal/hubcfg/hubcfg.go
 
       # 3.2 同站重试补丁：在 checkupdate.go 的 GetDigest 失败分支插入
       #     同一 URL 重试逻辑（不依赖第三方加速站）。锚点未命中（上游

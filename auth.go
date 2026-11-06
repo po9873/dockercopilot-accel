@@ -4,13 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	ref "github.com/distribution/reference"
+	"github.com/l429609201/dockerCopilot/internal/hubcfg"
 	"github.com/l429609201/dockerCopilot/internal/types"
 	"github.com/zeromicro/go-zero/core/logx"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -194,12 +194,12 @@ var (
 // 结果经 sync.Once 缓存，进程生命周期内保持不变，保证 digest 来源确定
 // （这正是上游移除旧实现时担心的点：旧版逐镜像串行探测且结果漂移）。
 func resolveHubHost() string {
+	// hubURL 可以配置多个自建站，当前站会随主备健康状态变化，
+	// 因此不能用 sync.Once 固定；hubcfg.Current() 自带 60 秒缓存。
+	if host := hubcfg.Current(); host != "" {
+		return host
+	}
 	acceleratorOnce.Do(func() {
-		if host := normalizeHubURL(os.Getenv("hubURL")); host != "" {
-			acceleratorHost = host
-			logx.Infof("hubURL 已配置，docker.io 镜像更新检查走加速站: %s", host)
-			return
-		}
 		if checkHost(DefaultRegistryHost) {
 			acceleratorHost = DefaultRegistryHost
 			return

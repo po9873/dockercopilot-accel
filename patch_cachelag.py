@@ -72,16 +72,17 @@ REPLACEMENT = """	// 远端与本地不一致时，先强制刷新自建加速�
 			}
 		}
 	}
-    // 复查后仍判定有更新时，再校验远端 manifest 是否「比本地还旧」。
+    // 复查后仍判定有更新时，再校验远端 manifest 是否可信、是否「比本地还旧」。
     // 自建站上游节点池可能长期缓存几天前的旧 index（STALE），本地刷不动时
-    // 靠镜像构建时间识别，避免把旧 manifest 当成新版报出来。
-    // 取不到远端构建时间时保持原判定，绝不吞掉真更新。
+    // 靠镜像构建时间识别；取不到构建时间（403/429/重启瞬间超时）说明
+    // 远端数据本身就不可信，同样不报更新，避免角标被一次抖动点亮。
+    // 两种情况都不是永久抑制：缓存到期后会重试，真更新恢复后照常报出。
     if needUpdate {
         verifyKey := tokenCacheKey(image)
         verifyToken, _ := i.lookupTokenCache(verifyKey)
         if stale, why := IsStaleRemoteManifest(digestURL, remoteDigest, verifyToken, image.Created); stale {
             needUpdate = false
-            logx.Infof("加速站陈旧 manifest 已排除 [%s] %s", imageRef, why)
+            logx.Infof("加速站疑似更新已排除 [%s] %s", imageRef, why)
         }
     }
 	status := StatusLatest
@@ -96,12 +97,13 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/l429609201/dockerCopilot/internal/hubcfg"
 )
 
 var hubRecheckMu sync.Mutex
@@ -119,18 +121,11 @@ func purgeHubManifestCache() bool {
 	hubRecheckAt = time.Now()
 	hubRecheckMu.Unlock()
 
-	raw := strings.TrimSpace(os.Getenv("hubURL"))
-	if raw == "" {
+	hn := hubcfg.Hostname()
+	if hn == "" {
 		return false
 	}
-	if !strings.Contains(raw, "://") {
-		raw = "https://" + raw
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Hostname() == "" {
-		return false
-	}
-	target := "http://" + net.JoinHostPort(u.Hostname(), "5003") + "/api/cache/cleanup?force=1"
+	target := "http://" + net.JoinHostPort(hn, "5003") + "/api/cache/cleanup?force=1"
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, nil)
@@ -189,14 +184,25 @@ func IsStaleRemoteManifest(manifestURL, remoteDigest, token string, localCreated
     staleCheckMu.Lock()
     e, hit := staleCheckCache[key]
     staleCheckMu.Unlock()
-    if !hit || time.Since(e.at) > 10*time.Minute {
+    // 能取到远端构建时间时缓存 10 分钟；取不到（加速站 403/429/超时）
+    // 只缓存 60 秒，尽快重试，避免长时间无法检出真更新。
+    ttl := 10 * time.Minute
+    if hit && !e.ok {
+        ttl = 60 * time.Second
+    }
+    if !hit || time.Since(e.at) > ttl {
         created, ok := fetchRemoteImageCreated(manifestURL, token)
         e = staleCheckEntry{at: time.Now(), created: created, ok: ok}
         staleCheckMu.Lock()
         staleCheckCache[key] = e
         staleCheckMu.Unlock()
     }
-    if !e.ok || e.created.Unix() > localCreated {
+    if !e.ok {
+        // 远端数据不可验证时不报更新。不是永久抑制：60 秒后重试，
+        // 加速站恢复且远端确实更新时照常报出。
+        return true, "远端构建时间不可验证（加速站数据不完整），暂不报更新"
+    }
+    if e.created.Unix() > localCreated {
         return false, ""
     }
     return true, fmt.Sprintf("远端构建时间 %s 不晚于本地 %s（加速站旧缓存）",
@@ -221,7 +227,7 @@ func fetchRemoteImageCreated(manifestURL, token string) (time.Time, bool) {
         "application/vnd.docker.distribution.manifest.v1+json",
     }, ", ")
     getJSON := func(u string) (map[string]interface{}, bool) {
-        ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+        ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
         defer cancel()
         req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
         if err != nil {

@@ -105,11 +105,11 @@ import (
 	"context"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/l429609201/dockerCopilot/internal/hubcfg"
 	"github.com/l429609201/dockerCopilot/internal/module/appconfig"
 	"github.com/zeromicro/go-zero/core/logx"
 )
@@ -125,15 +125,9 @@ func AcceleratedPullRef(imageNameAndTag, registryAuth, hostID string) (string, b
 	if registryAuth != "" {
 		return imageNameAndTag, false
 	}
-	raw := strings.TrimSpace(os.Getenv("hubURL"))
-	if raw == "" {
-		return imageNameAndTag, false
-	}
-	host := raw
-	if i := strings.Index(host, "://"); i >= 0 {
-		host = host[i+3:]
-	}
-	host = strings.Trim(host, "/")
+	// 与更新检测共用 hubcfg 选出的「当前站」：hubURL 配了多个自建站时，
+	// 拉取和检测必须落在同一个站，否则 tag->digest 映射会互相打架。
+	host := hubcfg.Host()
 	if host == "" {
 		return imageNameAndTag, false
 	}
@@ -188,18 +182,11 @@ func PurgeHubCache(ctx context.Context) {
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("hubCachePurge")), "off") {
 		return
 	}
-	raw := strings.TrimSpace(os.Getenv("hubURL"))
-	if raw == "" {
+	hn := hubcfg.Hostname()
+	if hn == "" {
 		return
 	}
-	if !strings.Contains(raw, "://") {
-		raw = "https://" + raw
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Hostname() == "" {
-		return
-	}
-	target := "http://" + net.JoinHostPort(u.Hostname(), "5003") + "/api/cache/cleanup?force=1"
+	target := "http://" + net.JoinHostPort(hn, "5003") + "/api/cache/cleanup?force=1"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, nil)
 	if err != nil {
 		return
