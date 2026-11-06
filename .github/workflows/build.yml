@@ -16,6 +16,9 @@ name: build-with-accelerator
 #   5. 用 patch_cachelag.py 做「复查确认」：疑似有更新时先强制刷新自建站
 #      manifest 缓存再重新取 digest，消除「刚更新完又提示」的误报；
 #      不使用任何抑制状态，真更新不会被压掉；
+#      另外识别「上游节点池长期缓存几天前旧 index（STALE）」：复查后仍不一致时
+#      沿同一自建站链路取远端镜像 config 的 created，不晚于本地则判为旧缓存、
+#      不报更新；取不到或确实更新时保持原判定（hubStaleCheck=off 可关）；
 #   6. 用 patch_pullviahub.py 让点「更新」时的镜像拉取也走同一个自建加速站，
 #      含带显式域名的官方站镜像（避免 100 次/小时/IP 限流导致拉不动），
 #      并在拉取前强制刷新该站 manifest 缓存；不碰宿主机 daemon 配置；
@@ -92,10 +95,12 @@ jobs:
           set -euo pipefail
           python3 patch_taskcenter.py
 
-      # 3.5 加速站 manifest 缓存滞后复查：KSpeeder 等自建缓存的 TTL 不可调，
-      #     缓存里的旧 digest 与刚更新的本地镜像永远不相等，导致「更新完又提示」。
-      #     疑似有更新时先 force=1 清该站缓存再重新 HEAD 一次，复查后仍不一致
-      #     才报真更新；不使用任何抑制状态，真更新不会被压掉。
+      # 3.5 加速站 manifest 缓存滞后复查 + 陈旧 index 识别：KSpeeder 等自建缓存
+      #     TTL 不可调，缓存里的旧 digest 与本地镜像永远不相等，导致「更新完又提示」，
+      #     上游节点池还可能长期返回几天前的旧 index（STALE）被误当成新版。
+      #     疑似有更新时先 force=1 清该站缓存再重新 HEAD 一次；复查后仍不一致时
+      #     取远端 manifest → config.created 与本地镜像构建时间比对，远端不晚于本地
+      #     即判为旧缓存。取不到信息时保持原判定，不使用任何抑制状态，真更新不压掉。
       #     30 秒内只清一次缓存，不依赖第三方、不碰代理、不改宿主机配置。
       - name: Overlay cache-lag recheck patch
         run: |

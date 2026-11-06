@@ -21,6 +21,12 @@
 
 不依赖任何第三方、不碰代理、不改宿主机 Docker 配置。
 hubCacheRecheck=off 可关闭复查（退回原判定）。
+
+此外增加「陈旧 manifest 识别」：自建站上游节点池可能长期缓存几天前的
+旧 index（X-Nginx-Cache-Status: STALE），本地刷新接口全部无效。复查后
+仍不一致时，沿同一个自建站链路取远端镜像 config 的 created，若它不晚于
+本地镜像构建时间，则判定为旧缓存、不报更新；取不到或确实更新时保持原判定，
+真更新不会被吞掉。hubStaleCheck=off 可单独关闭。
 锚点未命中（上游重构）时以非零码退出，让构建失败并通知维护者。
 """
 
@@ -66,6 +72,18 @@ REPLACEMENT = """	// 远端与本地不一致时，先强制刷新自建加速�
 			}
 		}
 	}
+    // 复查后仍判定有更新时，再校验远端 manifest 是否「比本地还旧」。
+    // 自建站上游节点池可能长期缓存几天前的旧 index（STALE），本地刷不动时
+    // 靠镜像构建时间识别，避免把旧 manifest 当成新版报出来。
+    // 取不到远端构建时间时保持原判定，绝不吞掉真更新。
+    if needUpdate {
+        verifyKey := tokenCacheKey(image)
+        verifyToken, _ := i.lookupTokenCache(verifyKey)
+        if stale, why := IsStaleRemoteManifest(digestURL, remoteDigest, verifyToken, image.Created); stale {
+            needUpdate = false
+            logx.Infof("加速站陈旧 manifest 已排除 [%s] %s", imageRef, why)
+        }
+    }
 	status := StatusLatest
 """
 
@@ -73,10 +91,14 @@ RECHECK_GO = '''package module
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -138,6 +160,147 @@ func RecheckRemoteDigest(digestURL, token string) (string, bool) {
 		return "", false
 	}
 	return digest, true
+}
+
+// ---- 加速站陈旧 manifest 识别（按镜像构建时间） ----
+
+type staleCheckEntry struct {
+    at      time.Time
+    created time.Time
+    ok      bool
+}
+
+var staleCheckMu sync.Mutex
+var staleCheckCache = map[string]staleCheckEntry{}
+
+// IsStaleRemoteManifest 判断远端 tag 指向的镜像是否不比本地新。
+// 只在检测结论为「有更新」时调用；返回 true 时调用方把结论改回「已是最新」。
+// 远端构建时间取不到、或确实晚于本地时一律返回 false，真更新不会被吞掉。
+// 结果按 manifestURL + digest 缓存 10 分钟，避免每轮检测重复回源。
+// 设置 hubStaleCheck=off 可关闭（退回原判定）。
+func IsStaleRemoteManifest(manifestURL, remoteDigest, token string, localCreated int64) (bool, string) {
+    if strings.EqualFold(strings.TrimSpace(os.Getenv("hubStaleCheck")), "off") {
+        return false, ""
+    }
+    if localCreated <= 0 || manifestURL == "" {
+        return false, ""
+    }
+    key := manifestURL + "|" + remoteDigest
+    staleCheckMu.Lock()
+    e, hit := staleCheckCache[key]
+    staleCheckMu.Unlock()
+    if !hit || time.Since(e.at) > 10*time.Minute {
+        created, ok := fetchRemoteImageCreated(manifestURL, token)
+        e = staleCheckEntry{at: time.Now(), created: created, ok: ok}
+        staleCheckMu.Lock()
+        staleCheckCache[key] = e
+        staleCheckMu.Unlock()
+    }
+    if !e.ok || e.created.Unix() > localCreated {
+        return false, ""
+    }
+    return true, fmt.Sprintf("远端构建时间 %s 不晚于本地 %s（加速站旧缓存）",
+        e.created.UTC().Format(time.RFC3339),
+        time.Unix(localCreated, 0).UTC().Format(time.RFC3339))
+}
+
+// fetchRemoteImageCreated 沿自建站链路取远端镜像 config 里的 created。
+// 依次：tag manifest ->（多架构时）子 manifest -> config blob -> created。
+// 全部走 hubURL 指向的自建加速站，不引入任何第三方源。
+func fetchRemoteImageCreated(manifestURL, token string) (time.Time, bool) {
+    idx := strings.LastIndex(manifestURL, "/manifests/")
+    if idx < 0 {
+        return time.Time{}, false
+    }
+    base := manifestURL[:idx]
+    accept := strings.Join([]string{
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.v1+json",
+    }, ", ")
+    getJSON := func(u string) (map[string]interface{}, bool) {
+        ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+        defer cancel()
+        req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+        if err != nil {
+            return nil, false
+        }
+        if token != "" {
+            req.Header.Set("Authorization", token)
+        }
+        req.Header.Set("Accept", accept)
+        res, err := digestHTTPClient.Do(req)
+        if err != nil {
+            return nil, false
+        }
+        defer res.Body.Close()
+        if res.StatusCode != http.StatusOK {
+            return nil, false
+        }
+        body, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
+        if err != nil {
+            return nil, false
+        }
+        var m map[string]interface{}
+        if json.Unmarshal(body, &m) != nil {
+            return nil, false
+        }
+        return m, true
+    }
+
+    configDigest := ""
+    top, ok := getJSON(manifestURL)
+    if !ok {
+        return time.Time{}, false
+    }
+    if list, isList := top["manifests"].([]interface{}); isList && len(list) > 0 {
+        for _, item := range list {
+            m, _ := item.(map[string]interface{})
+            plat, _ := m["platform"].(map[string]interface{})
+            arch, _ := plat["architecture"].(string)
+            osName, _ := plat["os"].(string)
+            d, _ := m["digest"].(string)
+            if d != "" && arch == runtime.GOARCH && (osName == "" || osName == runtime.GOOS) {
+                configDigest = d
+                break
+            }
+        }
+        if configDigest == "" {
+            if first, ok := list[0].(map[string]interface{}); ok {
+                configDigest, _ = first["digest"].(string)
+            }
+        }
+        if configDigest == "" {
+            return time.Time{}, false
+        }
+        child, ok := getJSON(base + "/manifests/" + configDigest)
+        if !ok {
+            return time.Time{}, false
+        }
+        cfg, _ := child["config"].(map[string]interface{})
+        configDigest, _ = cfg["digest"].(string)
+    } else {
+        cfg, _ := top["config"].(map[string]interface{})
+        configDigest, _ = cfg["digest"].(string)
+    }
+    if configDigest == "" {
+        return time.Time{}, false
+    }
+    cfgJSON, ok := getJSON(base + "/blobs/" + configDigest)
+    if !ok {
+        return time.Time{}, false
+    }
+    created, _ := cfgJSON["created"].(string)
+    if created == "" {
+        return time.Time{}, false
+    }
+    t, err := time.Parse(time.RFC3339Nano, created)
+    if err != nil {
+        return time.Time{}, false
+    }
+    return t, true
 }
 '''
 
