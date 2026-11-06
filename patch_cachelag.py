@@ -22,11 +22,14 @@
 不依赖任何第三方、不碰代理、不改宿主机 Docker 配置。
 hubCacheRecheck=off 可关闭复查（退回原判定）。
 
-此外增加「陈旧 manifest 识别」：自建站上游节点池可能长期缓存几天前的
-旧 index（X-Nginx-Cache-Status: STALE），本地刷新接口全部无效。复查后
-仍不一致时，沿同一个自建站链路取远端镜像 config 的 created，若它不晚于
-本地镜像构建时间，则判定为旧缓存、不报更新；取不到或确实更新时保持原判定，
-真更新不会被吞掉。hubStaleCheck=off 可单独关闭。
+此外增加「陈旧 manifest 识别 + STALE 站冷却降权」：自建站上游节点池可能
+长期缓存几天前的旧 index（STALE），本地刷新接口全部无效。复查后仍不一致时，
+沿同一个自建站链路取远端镜像 config 的 created：不晚于本地构建时间就判为
+旧缓存、不报更新；取不到则判为「不可验证」、同样不报更新。两种情况都会
+调用 hubcfg.MarkCurrentStale / MarkCurrentUnverified 把当前站冷却跳过，
+下一轮自动改用 hubURL 里的下一站，冷却到期后该站重新参与探测。
+远端确实更新（构建时间更晚）时保持原判定，真更新不会被吞掉。
+hubStaleCheck=off 可单独关闭。
 锚点未命中（上游重构）时以非零码退出，让构建失败并通知维护者。
 """
 
@@ -76,7 +79,8 @@ REPLACEMENT = """	// 远端与本地不一致时，先强制刷新自建加速�
     // 自建站上游节点池可能长期缓存几天前的旧 index（STALE），本地刷不动时
     // 靠镜像构建时间识别；取不到构建时间（403/429/重启瞬间超时）说明
     // 远端数据本身就不可信，同样不报更新，避免角标被一次抖动点亮。
-    // 两种情况都不是永久抑制：缓存到期后会重试，真更新恢复后照常报出。
+    // 两种情况都不是永久抑制：命中时把当前加速站冷却降权、切到备站，
+    // 冷却到期或该站缓存收敛后重新参与探测，真更新恢复后照常报出。
     if needUpdate {
         verifyKey := tokenCacheKey(image)
         verifyToken, _ := i.lookupTokenCache(verifyKey)
@@ -200,17 +204,22 @@ func IsStaleRemoteManifest(manifestURL, remoteDigest, token string, localCreated
     if !e.ok {
         // 远端数据不可验证时不报更新。不是永久抑制：60 秒后重试，
         // 加速站恢复且远端确实更新时照常报出。
-        // 同时立刻让当前加速站选择失效：上游回源超时往往是整站问题，
-        // 下一轮检测会重新探测并切到备站，不必等满 60 秒。
-        hubcfg.Invalidate()
+        // 同时把当前站标记为「暂时不可验证」并立即失效：上游回源超时
+        // 往往是整站问题，下一轮检测会自动切到备站，不必等满 60 秒。
+        hubcfg.MarkCurrentUnverified("远端构建时间不可验证")
         return true, "远端构建时间不可验证（加速站数据不完整），暂不报更新"
     }
     if e.created.Unix() > localCreated {
         return false, ""
     }
-    return true, fmt.Sprintf("远端构建时间 %s 不晚于本地 %s（加速站旧缓存）",
+    // 远端 manifest 比本地镜像还旧：这是加速站 tag 缓存长期停在旧 index
+    // 的确凿证据。除了不报更新（避免点了更新反而拉回旧版），还要把该站
+    // 冷却降权，下一轮自动改用配置里的下一站，不再依赖这份旧缓存。
+    why := fmt.Sprintf("远端构建时间 %s 不晚于本地 %s（加速站旧缓存）",
         e.created.UTC().Format(time.RFC3339),
         time.Unix(localCreated, 0).UTC().Format(time.RFC3339))
+    hubcfg.MarkCurrentStale(why)
+    return true, why
 }
 
 // fetchRemoteImageCreated 沿自建站链路取远端镜像 config 里的 created。

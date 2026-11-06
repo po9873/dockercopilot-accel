@@ -4,6 +4,9 @@
 // 若轮换/并发使用，检测结论会在不同站的 STALE 旧 manifest 之间跳动，
 // 界面就会「动不动提示有更新」。这里按配置顺序选第一个可达的站，
 // 主站健康期间永不切换，主站恢复后自动切回，因此不会冲突。
+// 检测链路明确判定某站「喂的是旧缓存」（远端不比本地新 / 数据不可验证）时，
+// 调用 MarkCurrentStale 让该站冷却跳过、自动改用下一站，解决「站活着但
+// 一直返回几天前的旧 index」；冷却到期重新参与探测，无需人工改配置顺序。
 //
 // 健康探测使用真实 manifest GET（默认 library/nginx），而不是 /v2/：
 // 自建加速站的 /v2/ 由本地直接应答，上游节点池回源卡死时仍秒回 200，
@@ -36,6 +39,15 @@ const probeTimeout = 5 * time.Second
 // 避免一轮检测里多个镜像取不到数据时反复发起探测。
 const invalidateInterval = 30 * time.Second
 
+// staleCooldown 是「明确判定某站数据陈旧」后的冷却时长：冷却期内该站
+// 不参与主备探测，DC 自动改用配置里的下一站；到期后重新给它机会，
+// 加速站缓存一旦收敛就自动恢复，不需要人工改 hubURL 顺序。
+const staleCooldown = 10 * time.Minute
+
+// unverifiedCooldown 用于「远端数据暂时不可验证」（上游抖动 / 重建瞬间），
+// 比明确旧缓存短得多，避免一次偶发超时就把整站排除十分钟。
+const unverifiedCooldown = 2 * time.Minute
+
 const defaultProbeRepo = "library/nginx"
 
 // manifestAccept 与检测链路保持一致，避免加速站因 Accept 头不同而返回 404/406。
@@ -49,6 +61,7 @@ var (
 	selected       string
 	selectedAt     time.Time
 	lastInvalidate time.Time
+	staleUntil     = map[string]time.Time{}
 	configOnce     sync.Once
 )
 
@@ -112,16 +125,34 @@ func Current() string {
 
 	selectMu.Lock()
 	defer selectMu.Unlock()
-	if selected != "" && time.Since(selectedAt) < selectTTL && hasTarget(ts, selected) {
+	now := time.Now()
+	if selected != "" && time.Since(selectedAt) < selectTTL &&
+		hasTarget(ts, selected) && !inCooldown(selected, now) {
 		return selected
 	}
+
+	// 明确判定「数据陈旧」的站冷却期内不参与探测；若所有站都被标记，
+	// 清空冷却重新给全部站机会，避免某次集体 STALE 后永久无站可用。
+	candidates := make([]string, 0, len(ts))
 	for _, t := range ts {
+		if inCooldown(t, now) {
+			logx.Infof("加速站数据陈旧冷却中，跳过 [%s]", t)
+			continue
+		}
+		candidates = append(candidates, t)
+	}
+	if len(candidates) == 0 {
+		staleUntil = map[string]time.Time{}
+		candidates = ts
+		logx.Infof("所有 hubURL 加速站均处于陈旧冷却，重新探测")
+	}
+	for _, t := range candidates {
 		ok, why := reachable(t)
 		if ok {
 			if selected != "" && selected != t {
 				logx.Infof("加速站主备切换: %s -> %s", selected, t)
 			}
-			selected, selectedAt = t, time.Now()
+			selected, selectedAt = t, now
 			return t
 		}
 		logx.Errorf("加速站健康探测失败 [%s]: %s", t, why)
@@ -133,7 +164,7 @@ func Current() string {
 	} else {
 		logx.Errorf("所有 hubURL 加速站均不可达，沿用上次选择: %s", selected)
 	}
-	selectedAt = time.Now()
+	selectedAt = now
 	return selected
 }
 
@@ -148,6 +179,48 @@ func Invalidate() {
 	}
 	lastInvalidate = time.Now()
 	selectedAt = time.Time{}
+}
+
+// inCooldown 判断某站是否仍在「数据陈旧」冷却期；调用方需持有 selectMu。
+func inCooldown(target string, now time.Time) bool {
+	until, ok := staleUntil[target]
+	return ok && until.After(now)
+}
+
+// MarkCurrentStale 标记当前站「明确返回旧缓存」（远端构建时间不晚于本地）。
+// 冷却期内该站不参与探测，下一轮自动改用配置里的下一站；到期自动恢复。
+// 只有确凿判定才调用，不因两站 digest 不同就切站，避免主备来回抖动。
+func MarkCurrentStale(reason string) {
+	markStale(reason, staleCooldown)
+}
+
+// MarkCurrentUnverified 标记「远端数据暂时不可验证」（上游超时 / 403 / 429）。
+// 冷却较短，恢复后很快重新参与探测；同样会立即切换到备站。
+func MarkCurrentUnverified(reason string) {
+	markStale(reason, unverifiedCooldown)
+}
+
+func markStale(reason string, cooldown time.Duration) {
+	selectMu.Lock()
+	defer selectMu.Unlock()
+	t := selected
+	if t == "" {
+		// 单站配置直接返回 ts[0]、不设置 selected，也就没有站可切换。
+		logx.Errorf("加速站数据陈旧，但当前无选中站（单站配置无法切换）: %s", reason)
+		return
+	}
+	now := time.Now()
+	if until, ok := staleUntil[t]; ok && until.After(now) {
+		// 同一轮检测里多个镜像都可能命中：只续期（不缩短已有冷却），
+		// 不重复失效、不刷日志，避免一次检测把主备来回切。
+		if now.Add(cooldown).After(until) {
+			staleUntil[t] = now.Add(cooldown)
+		}
+		return
+	}
+	staleUntil[t] = now.Add(cooldown)
+	selectedAt = time.Time{} // 立即失效，下一次 Current() 重新探测
+	logx.Errorf("加速站数据陈旧，冷却 %v 后重试 [%s]: %s", cooldown, t, reason)
 }
 
 // Host 返回当前站不含 scheme 的 host（含端口），用于拼镜像引用。
