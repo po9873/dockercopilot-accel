@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
-"""抑制「自建加速站 manifest 缓存滞后」造成的「更新完又提示」死循环。
+"""消除「自建加速站 manifest 缓存滞后」造成的误报与「更新完又提示」。
 
 现象：KSpeeder 之类自建 pull-through 缓存的 manifest TTL 不可调，缓存里
-可能长期停留旧 digest。用户点更新后本地 RepoDigests 变成新值，而远端
-检测仍返回旧 digest；上游 checkupdate.go 的判据是「远端 digest 不在本地
-RepoDigests 里就算有更新」，于是刚更新完立刻又被标成有更新，无限循环。
+可能长期停留几天前的旧 index。DC 检测拿旧 digest 去比本地 RepoDigests，
+不等就报「有更新」；用户点更新后本地换成新 digest，缓存仍是旧的，
+于是刚更新完立刻又被标成有更新，无限循环。实测中 DC 拿到的「远端」
+甚至比本机镜像还旧。
 
-本补丁在 checkSingleImage 的比对前插入一个轻量状态机（状态持久化到
-/data，DC 容器重启不丢）：
-  - 本地 digest 发生变化  -> 说明用户刚更新过，把当前远端 digest 记为「已抑制」；
-  - 远端仍返回同一 digest  -> 不再报更新；
-  - 远端 digest 发生变化  -> 缓存刷新或真有新版本，清除抑制，恢复正常判定。
+旧实现用 /data/image_update_suppress.json 做「抑制」：把某个远端 digest
+记住就不再报。方向是错的——真更新也会被一起压掉，且无法区分缓存滞后
+和真的推了新版。
+
+本补丁改为「复查确认」，不抑制任何更新：
+  1. 只有当「远端 digest 不在本地 RepoDigests」时才触发复查；
+  2. 强制刷新自建加速站 manifest 缓存（force=1，30 秒内只清一次），
+     再重新 HEAD 一次远端 digest，绕过 DC 自己的 digestCache；
+  3. 复查后与本地一致 -> 判定为缓存滞后，角标消失；
+     复查后仍不一致 -> 判定为真更新，正常报出并把新 digest 写回缓存。
+只在疑似有更新时清缓存，不影响已有镜像的加速命中。
 
 不依赖任何第三方、不碰代理、不改宿主机 Docker 配置。
+hubCacheRecheck=off 可关闭复查（退回原判定）。
 锚点未命中（上游重构）时以非零码退出，让构建失败并通知维护者。
 """
 
@@ -20,128 +28,116 @@ import sys
 from pathlib import Path
 
 CHECKUPDATE = Path("upstream/internal/module/checkupdate.go")
-STATE_FILE = Path("upstream/internal/module/update_suppress.go")
+STATE_FILE = Path("upstream/internal/module/hubrecheck.go")
 
-# 在「远端 digest 为空」检查之后、正式比对之前插入抑制判断。
-ANCHOR = """	if remoteDigest == "" {
-		logx.Errorf("远端返回的 digest 为空 [%s]", imageRef)
-		markUnknown("远端返回的 digest 为空")
-		return
+# 在比对出 needUpdate 之后、写入 status 之前插入复查确认。
+# 只锚定这一行，避免上游比对循环重构后补丁失配。
+ANCHOR = "\tstatus := StatusLatest\n"
+
+REPLACEMENT = """	// 远端与本地不一致时，先强制刷新自建加速站 manifest 缓存再复查一次。
+	// KSpeeder 的 manifest TTL 不可调，缓存可能停留在几天前的旧 index：
+	// 用户刚更新完，本地是新 digest，检测却拿到旧 digest，于是「更新完又提示」。
+	// 复查后仍不一致才判定真更新；这里不做任何「抑制」，真更新不会被压掉。
+	if needUpdate {
+		// 复用本轮 token 缓存，避免复查给官方站增加额外请求（有 100 次/小时/IP 限流）。
+		recheckKey := tokenCacheKey(image)
+		recheckToken, tokenCached := i.lookupTokenCache(recheckKey)
+		if !tokenCached {
+			var tokenErr error
+			recheckToken, tokenErr = GetToken(image, "")
+			if tokenErr != nil {
+				logx.Debugf("复查获取 token 失败 [%s]: %v", imageRef, tokenErr)
+			}
+			i.storeTokenCache(recheckKey, recheckToken)
+		}
+		if fresh, ok := RecheckRemoteDigest(digestURL, recheckToken); ok && fresh != "" {
+			remoteDigest = fresh
+			i.storeDigestCache(digestURL, fresh)
+			needUpdate = true
+			for _, localRepoDigests := range image.RepoDigests {
+				parts := strings.SplitN(localRepoDigests, "@", 2)
+				if len(parts) == 2 && parts[1] == fresh {
+					needUpdate = false
+					break
+				}
+			}
+			if !needUpdate {
+				logx.Infof("缓存滞后已排除 [%s] 复查后与本地一致 digest=%s", imageRef, fresh)
+			}
+		}
 	}
+	status := StatusLatest
 """
 
-REPLACEMENT = """	if remoteDigest == "" {
-		logx.Errorf("远端返回的 digest 为空 [%s]", imageRef)
-		markUnknown("远端返回的 digest 为空")
-		return
-	}
-
-	// 自建加速站 manifest 缓存可能长期停留在旧 digest，与刚更新的本地镜像
-	// 永远不相等，导致「更新完又提示」死循环。这里按镜像引用记录本地/远端
-	// digest：本地变化即抑制同一远端 digest，直到远端真的变了才恢复判定。
-	localDigestKey := strings.Join(image.RepoDigests, ",")
-	if ReconcileUpdateState(imageRef, remoteDigest, localDigestKey) {
-		i.setResult(image.ID, ImageCheckList{NeedUpdate: false, Status: StatusLatest})
-		return
-	}
-"""
-
-STATE_GO = '''package module
+RECHECK_GO = '''package module
 
 import (
-	"encoding/json"
+	"context"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
+	"time"
 )
 
-// 加速站 manifest 缓存滞后抑制状态（DC 容器内 /data 为持久化卷）。
-const updateSuppressPath = "/data/image_update_suppress.json"
+var hubRecheckMu sync.Mutex
+var hubRecheckAt time.Time
 
-type updateSuppressState struct {
-	LastLocal  map[string]string `json:"lastLocal"`
-	Suppressed map[string]string `json:"suppressed"`
-}
+// purgeHubManifestCache 强制刷新自建加速站 manifest 缓存。
+// 管理口地址由 hubURL 的 host 推导（同机 5003 端口）。一轮检测中多个镜像
+// 同时疑似有更新时，30 秒内只清一次；第一次清完后后续 HEAD 自然回源。
+func purgeHubManifestCache() bool {
+	hubRecheckMu.Lock()
+	if time.Since(hubRecheckAt) < 30*time.Second {
+		hubRecheckMu.Unlock()
+		return true
+	}
+	hubRecheckAt = time.Now()
+	hubRecheckMu.Unlock()
 
-type updateSuppressStore struct {
-	mu    sync.Mutex
-	state updateSuppressState
-}
-
-var imageUpdateSuppress = newUpdateSuppressStore()
-
-func newUpdateSuppressStore() *updateSuppressStore {
-	s := &updateSuppressStore{state: updateSuppressState{
-		LastLocal:  map[string]string{},
-		Suppressed: map[string]string{},
-	}}
-	b, err := os.ReadFile(updateSuppressPath)
+	raw := strings.TrimSpace(os.Getenv("hubURL"))
+	if raw == "" {
+		return false
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return false
+	}
+	target := "http://" + net.JoinHostPort(u.Hostname(), "5003") + "/api/cache/cleanup?force=1"
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, nil)
 	if err != nil {
-		return s
+		return false
 	}
-	var loaded updateSuppressState
-	if json.Unmarshal(b, &loaded) != nil {
-		return s
-	}
-	if loaded.LastLocal != nil {
-		s.state.LastLocal = loaded.LastLocal
-	}
-	if loaded.Suppressed != nil {
-		s.state.Suppressed = loaded.Suppressed
-	}
-	return s
-}
-
-func (s *updateSuppressStore) save() {
-	b, err := json.Marshal(s.state)
+	res, err := (&http.Client{Timeout: 6 * time.Second}).Do(req)
 	if err != nil {
-		return
+		return false
 	}
-	// /data 不存在（本地构建/测试）时忽略写失败，内存状态仍然有效。
-	_ = os.WriteFile(updateSuppressPath, b, 0644)
+	defer res.Body.Close()
+	return res.StatusCode >= 200 && res.StatusCode < 300
 }
 
-// ReconcileUpdateState 返回本轮是否应抑制「有更新」提示。
-// ref 为镜像名:tag，remoteDigest 为加速站返回的 digest，localDigestKey
-// 为本地 RepoDigests 拼接值。返回 true 表示本地已更新过且远端仍是同一
-// （可能滞后的）digest，不应再报更新。
-func (s *updateSuppressStore) ReconcileUpdateState(ref, remoteDigest, localDigestKey string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	changed := false
-	prevLocal, known := s.state.LastLocal[ref]
-	if known && localDigestKey != "" && prevLocal != "" && localDigestKey != prevLocal {
-		// 本地镜像刚被更新过：记住当前远端 digest，避免缓存滞后反复误报。
-		if remoteDigest != "" {
-			s.state.Suppressed[ref] = remoteDigest
-			changed = true
-		}
+// RecheckRemoteDigest 在疑似有更新时，清缓存后重新取一次远端 manifest digest。
+// 返回 (新 digest, 是否成功)。失败时保持原判定，不影响正常检测。
+// 设置 hubCacheRecheck=off 可关闭。
+func RecheckRemoteDigest(digestURL, token string) (string, bool) {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("hubCacheRecheck")), "off") {
+		return "", false
 	}
-	if !known || s.state.LastLocal[ref] != localDigestKey {
-		s.state.LastLocal[ref] = localDigestKey
-		changed = true
+	if !purgeHubManifestCache() {
+		return "", false
 	}
-
-	if sup, ok := s.state.Suppressed[ref]; ok {
-		if sup == remoteDigest {
-			if changed {
-				s.save()
-			}
-			return true
-		}
-		// 远端 digest 变化：缓存已刷新或确实推了新版本，恢复正常判定。
-		delete(s.state.Suppressed, ref)
-		changed = true
+	digest, err := GetDigest(digestURL, token)
+	if err != nil || digest == "" {
+		return "", false
 	}
-	if changed {
-		s.save()
-	}
-	return false
-}
-
-// ReconcileUpdateState 供 checkupdate.go 调用（同包，无需 import）。
-func ReconcileUpdateState(ref, remoteDigest, localDigestKey string) bool {
-	return imageUpdateSuppress.ReconcileUpdateState(ref, remoteDigest, localDigestKey)
+	return digest, true
 }
 '''
 
@@ -161,8 +157,8 @@ def main() -> int:
         )
         return 1
     CHECKUPDATE.write_text(text.replace(ANCHOR, REPLACEMENT), encoding="utf-8", newline="\n")
-    STATE_FILE.write_text(STATE_GO, encoding="utf-8", newline="\n")
-    print("[patch_cachelag] 加速站缓存滞后抑制补丁已应用（状态持久化到 /data）")
+    STATE_FILE.write_text(RECHECK_GO, encoding="utf-8", newline="\n")
+    print("[patch_cachelag] 缓存滞后复查确认补丁已应用（不抑制任何真更新）")
     return 0
 
 

@@ -149,7 +149,28 @@ func AcceleratedPullRef(imageNameAndTag, registryAuth, hostID string) (string, b
 	if i := strings.Index(first, "/"); i >= 0 {
 		first = first[:i]
 	}
-	if first == "localhost" || strings.ContainsAny(first, ".:") {
+	if first == "localhost" {
+		return imageNameAndTag, false
+	}
+	if strings.ContainsAny(first, ".:") {
+		// 显式 registry 域名：只改写白名单内的源站（默认官方 KSpeeder 站），
+		// 剥掉域名后走自建加速站上的同名仓库，避免直连官方站撞
+		// 100 次/小时/IP 匿名限流，导致「界面提示有更新，点更新却拉不动」。
+		// GHCR / 私有 registry 不在白名单内，保持原名以免绕错源站。
+		allow := strings.TrimSpace(os.Getenv("hubRewriteDomains"))
+		if allow == "" {
+			allow = "registry.kspeeder.com"
+		}
+		for _, d := range strings.Split(allow, ",") {
+			if !strings.EqualFold(strings.TrimSpace(d), first) {
+				continue
+			}
+			repo := strings.TrimPrefix(name, first+"/")
+			if repo == "" || repo == first {
+				return imageNameAndTag, false
+			}
+			return host + "/" + repo + imageNameAndTag[len(name):], true
+		}
 		return imageNameAndTag, false
 	}
 	if strings.HasPrefix(imageNameAndTag, host+"/") {

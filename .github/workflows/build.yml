@@ -5,17 +5,21 @@ name: build-with-accelerator
 # 也支持在 Actions 页面手动 Run workflow 立即构建。
 #
 # 补丁内容：
-#   1. 用本仓库的 auth.go（含 Docker Hub 加速站 + 兜底机制）覆盖上游同名文件；
-#   2. 用 patch_checkupdate.py 在上游 checkupdate.go 的 digest 获取失败分支
-#      插入「兜底加速站重试」，解决部分加速站（如 linkease/iStoreOS 本地缓存）
-#      只覆盖已缓存仓库、未缓存仓库 403/525 导致"检测不到更新"的问题；
+#   1. 用本仓库的 auth.go 覆盖上游同名文件：检测只走镜像自身声明的源站，
+#      不引入任何第三方加速站或兜底；
+#   2. 用 patch_checkupdate.py 修复 BuildManifestURL 的 scheme 拼接，并给
+#      digest 获取加同 URL 重试（300/600/900ms 退避）；
 #   3. 用 patch_scheduler.py 让定时检测始终执行（上游把检测绑死在 Telegram
 #      开关上，未开 TG 时界面快照永不刷新：检不出新版 / 一直误报有更新）；
 #   4. 用 patch_taskcenter.py 把任务中心「清除已完成」持久化到 localStorage，
 #      避免刷新页面后 SSE 把后端仍保留的全量任务重新推回来；
-#   5. 用 patch_pullviahub.py 让点「更新」时的镜像拉取也走同一个自建加速站，
+#   5. 用 patch_cachelag.py 做「复查确认」：疑似有更新时先强制刷新自建站
+#      manifest 缓存再重新取 digest，消除「刚更新完又提示」的误报；
+#      不使用任何抑制状态，真更新不会被压掉；
+#   6. 用 patch_pullviahub.py 让点「更新」时的镜像拉取也走同一个自建加速站，
+#      含带显式域名的官方站镜像（避免 100 次/小时/IP 限流导致拉不动），
 #      并在拉取前强制刷新该站 manifest 缓存；不碰宿主机 daemon 配置；
-#   6. 用 patch_attribution.py 把镜像内维护者署名改为 po9873（原作者 onlyLTY · DongShu 署名保留）。
+#   7. 用 patch_attribution.py 把镜像内维护者署名改为 po9873（原作者 onlyLTY · DongShu 署名保留）。
 #
 # Docker Hub 推送需要在仓库 Settings → Secrets → Actions 配置：
 #   DOCKERHUB_USERNAME  Docker Hub 用户名
@@ -88,11 +92,12 @@ jobs:
           set -euo pipefail
           python3 patch_taskcenter.py
 
-      # 3.5 加速站 manifest 缓存滞后抑制：KSpeeder 等自建缓存的 TTL 不可调，
+      # 3.5 加速站 manifest 缓存滞后复查：KSpeeder 等自建缓存的 TTL 不可调，
       #     缓存里的旧 digest 与刚更新的本地镜像永远不相等，导致「更新完又提示」。
-      #     按镜像引用记录本地/远端 digest，状态持久化到 /data，远端 digest
-      #     变化时才恢复判定。不依赖第三方、不碰代理、不改宿主机配置。
-      - name: Overlay cache-lag suppression patch
+      #     疑似有更新时先 force=1 清该站缓存再重新 HEAD 一次，复查后仍不一致
+      #     才报真更新；不使用任何抑制状态，真更新不会被压掉。
+      #     30 秒内只清一次缓存，不依赖第三方、不碰代理、不改宿主机配置。
+      - name: Overlay cache-lag recheck patch
         run: |
           set -euo pipefail
           python3 patch_cachelag.py
