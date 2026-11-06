@@ -9,8 +9,10 @@
 
 补丁做三件事：
   1. 新增 internal/utiles/hubpull.go：把 Docker Hub 镜像改写为
-     <hubURL host>/<repo>:<tag>；仅对本地主机、匿名、无显式 registry 前缀的
-     镜像生效，GHCR / 私有 registry / 带凭据镜像保持原名。
+     <hubURL host>/<repo>:<tag>；单段官方镜像名补 library/ 前缀
+     （KSpeeder 对 <host>/alpine:latest 返回 401，必须写成
+     <host>/library/alpine:latest）；仅对本地主机、匿名、无显式 registry
+     前缀的镜像生效，GHCR / 私有 registry / 带凭据镜像保持原名。
   2. 两处 ImagePull 改用加速站引用，拉完用 ImageTag 打回原名、
      再用 ImageRemove 删掉临时引用（主备切换不会累积 <站域名>/ 别名），
      后续 ImageInspect / ContainerCreate 完全不动；
@@ -186,6 +188,13 @@ func AcceleratedPullRef(imageNameAndTag, registryAuth, hostID string) (string, b
 	}
 	if strings.HasPrefix(imageNameAndTag, host+"/") {
 		return imageNameAndTag, false
+	}
+	// 官方单段镜像名（alpine:latest、nginx:1.25 等）在部分自建加速站
+	// （如 KSpeeder）上必须写成 library/<name>，直接拼 <host>/<name> 会返回
+	// 401 unauthorized。Docker Hub 本身也把单段名字归一到 library/，
+	// 这里保持一致；打回原名仍用 imageNameAndTag，不影响容器镜像引用。
+	if !strings.Contains(name, "/") {
+		return host + "/library/" + imageNameAndTag, true
 	}
 	return host + "/" + imageNameAndTag, true
 }
