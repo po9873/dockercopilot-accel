@@ -119,8 +119,9 @@ jobs:
 
       # 3.6 拉取链路改走自建加速站：上游 ImagePull 传原始镜像名，请求由宿主机
       #     daemon 直连 registry-1.docker.io，完全绕过 hubURL，导致"检测到更新
-      #     却拉不动"。补丁把 Docker Hub 镜像改写为 hubURL 前缀、拉完 tag 回原名，
-      #     并覆盖 DC 自更新的第二处 ImagePull；拉取前调用自建站 force=1 清缓存。
+      #     却拉不动"。补丁把 Docker Hub 镜像改写为 hubURL 前缀、拉完 tag 回原名、
+      #     再删掉临时引用（主备切换不累积 <站域名>/ 别名），并覆盖 DC 自更新的
+      #     第二处 ImagePull；拉取前调用自建站 force=1 清缓存。
       - name: Overlay pull-via-hub patch
         run: |
           set -euo pipefail

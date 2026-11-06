@@ -11,8 +11,9 @@
   1. 新增 internal/utiles/hubpull.go：把 Docker Hub 镜像改写为
      <hubURL host>/<repo>:<tag>；仅对本地主机、匿名、无显式 registry 前缀的
      镜像生效，GHCR / 私有 registry / 带凭据镜像保持原名。
-  2. 两处 ImagePull 改用加速站引用，拉完用 ImageTag 打回原名，
-     后续 ImageInspect / ContainerCreate 完全不动。
+  2. 两处 ImagePull 改用加速站引用，拉完用 ImageTag 打回原名、
+     再用 ImageRemove 删掉临时引用（主备切换不会累积 <站域名>/ 别名），
+     后续 ImageInspect / ContainerCreate 完全不动；
   3. 拉取前调用自建加速站管理口 /api/cache/cleanup?force=1 强制刷新
      manifest 缓存（KSpeeder TTL 不可调，普通 cleanup 只清过期条目），
      避免拉到缓存里的旧 digest。失败只记日志、不阻断；hubCachePurge=off 可关。
@@ -60,6 +61,15 @@ REPL_DECODE = """	err = decodePullResp(ctx, reader, serviceContext, taskID)
 			logx.Errorf("Failed to tag image %s -> %s: %s", pullRef, imageNameAndTag, tagErr)
 			return tagErr
 		}
+		// 打标成功后删掉加速站域名的临时引用。原名 tag 已存在，ImageRemove
+		// 只会 untag 这一个引用，不会删除镜像层。主备切换时若不清理，镜像列表
+		// 里同一个 ID 会不断累积 <站域名>/<repo>:<tag> 别名。
+		// 清理失败不影响更新结果，仅记日志。
+		if _, rmErr := cli.ImageRemove(ctx, pullRef, image.RemoveOptions{}); rmErr != nil {
+			logx.Infof("warn: 临时镜像引用清理失败（不影响更新）: %s -> %v", pullRef, rmErr)
+		} else {
+			logx.Infof("临时镜像引用已清理: %s", pullRef)
+		}
 	}
 	if err != nil {
 		markTaskFailed(serviceContext, taskID, &oldTaskProgress, "拉取镜像失败", err)
@@ -93,6 +103,13 @@ REPL_SELF = """func pullImageForSelfUpdate(ctx context.Context, svcCtx *svc.Serv
 	if viaHub {
 		if tagErr := svcCtx.DockerClient.ImageTag(ctx, pullRef, imageNameAndTag); tagErr != nil {
 			return tagErr
+		}
+		// 同 UpdateContainerOnHost：删掉加速站域名的临时引用，避免主备切换后
+		// 镜像列表累积别名。清理失败只记日志，不阻断自更新。
+		if _, rmErr := svcCtx.DockerClient.ImageRemove(ctx, pullRef, image.RemoveOptions{}); rmErr != nil {
+			logx.Infof("warn: 临时镜像引用清理失败（不影响更新）: %s -> %v", pullRef, rmErr)
+		} else {
+			logx.Infof("临时镜像引用已清理: %s", pullRef)
 		}
 	}
 	return nil
