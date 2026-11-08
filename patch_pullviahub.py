@@ -13,9 +13,10 @@
      （KSpeeder 对 <host>/alpine:latest 返回 401，必须写成
      <host>/library/alpine:latest）；仅对本地主机、匿名、无显式 registry
      前缀的镜像生效，GHCR / 私有 registry / 带凭据镜像保持原名。
-  2. 两处 ImagePull 改用加速站引用，拉完用 ImageTag 打回原名、
-     再用 ImageRemove 删掉临时引用（主备切换不会累积 <站域名>/ 别名），
-     后续 ImageInspect / ContainerCreate 完全不动；
+  2. 两处 ImagePull 改用加速站引用，拉完用 ImageTag 打回原名，并保留当前
+     加速站引用（它携带 RepoDigests，DC 检测靠它判断「已是最新」），
+     只清理 hubURL 里「其它加速站」的同名别名（主备切换不会累积 <站域名>/
+     别名、也不清空 RepoDigests）；后续 ImageInspect / ContainerCreate 完全不动；
   3. 拉取前调用自建加速站管理口 /api/cache/cleanup?force=1 强制刷新
      manifest 缓存（KSpeeder TTL 不可调，普通 cleanup 只清过期条目），
      避免拉到缓存里的旧 digest。失败只记日志、不阻断；hubCachePurge=off 可关。
@@ -63,15 +64,11 @@ REPL_DECODE = """	err = decodePullResp(ctx, reader, serviceContext, taskID)
 			logx.Errorf("Failed to tag image %s -> %s: %s", pullRef, imageNameAndTag, tagErr)
 			return tagErr
 		}
-		// 打标成功后删掉加速站域名的临时引用。原名 tag 已存在，ImageRemove
-		// 只会 untag 这一个引用，不会删除镜像层。主备切换时若不清理，镜像列表
-		// 里同一个 ID 会不断累积 <站域名>/<repo>:<tag> 别名。
-		// 清理失败不影响更新结果，仅记日志。
-		if _, rmErr := cli.ImageRemove(ctx, pullRef, image.RemoveOptions{}); rmErr != nil {
-			logx.Infof("warn: 临时镜像引用清理失败（不影响更新）: %s -> %v", pullRef, rmErr)
-		} else {
-			logx.Infof("临时镜像引用已清理: %s", pullRef)
-		}
+		// 关键：保留当前加速站引用 pullRef（它携带 RepoDigests），只清理
+		// 其它加速站同名别名。删掉 pullRef 会清空镜像 RepoDigests，导致
+		// 检测落回「未知/误报」。详见 hubpull.go 的 CleanOtherHubAliases。
+		CleanOtherHubAliases(ctx, cli, pullRef)
+		logx.Infof("加速站引用已保留（携带 RepoDigests，保证检测可用）: %s", pullRef)
 	}
 	if err != nil {
 		markTaskFailed(serviceContext, taskID, &oldTaskProgress, "拉取镜像失败", err)
@@ -106,13 +103,10 @@ REPL_SELF = """func pullImageForSelfUpdate(ctx context.Context, svcCtx *svc.Serv
 		if tagErr := svcCtx.DockerClient.ImageTag(ctx, pullRef, imageNameAndTag); tagErr != nil {
 			return tagErr
 		}
-		// 同 UpdateContainerOnHost：删掉加速站域名的临时引用，避免主备切换后
-		// 镜像列表累积别名。清理失败只记日志，不阻断自更新。
-		if _, rmErr := svcCtx.DockerClient.ImageRemove(ctx, pullRef, image.RemoveOptions{}); rmErr != nil {
-			logx.Infof("warn: 临时镜像引用清理失败（不影响更新）: %s -> %v", pullRef, rmErr)
-		} else {
-			logx.Infof("临时镜像引用已清理: %s", pullRef)
-		}
+		// 同 UpdateContainerOnHost：保留当前加速站引用（携带 RepoDigests，
+		// 保证检测可用），只清理其它加速站同名别名，避免主备切换累积别名。
+		CleanOtherHubAliases(ctx, svcCtx.DockerClient, pullRef)
+		logx.Infof("自更新：加速站引用已保留（携带 RepoDigests）: %s", pullRef)
 	}
 	return nil
 }
@@ -128,10 +122,50 @@ import (
 	"strings"
 	"time"
 
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/client"
 	"github.com/l429609201/dockerCopilot/internal/hubcfg"
 	"github.com/l429609201/dockerCopilot/internal/module/appconfig"
 	"github.com/zeromicro/go-zero/core/logx"
 )
+
+// CleanOtherHubAliases 保留「当前加速站」引用（它携带 RepoDigests，
+// 形如 qqaazz.../library/nginx@sha256:...），只清理 hubURL 里「其它加速站」
+// 的同名引用，避免主备切换后同一个镜像 ID 不断累积多个 <站域名>/<repo>:<tag>
+// 别名。
+//
+// 为什么必须保留当前加速站引用、不能像旧版那样直接删掉：
+// 镜像的 RepoDigests 是跟着「从哪个仓库拉下来」的引用走的。DC 检测只取
+// RepoDigests 里 @ 之后的 digest 值（内容寻址，与挂在哪个加速站 host 上无关）
+// 和远端同源站 digest 值比对；只要这个值存在且一致就判「已是最新」。旧版
+// ImageRemove(pullRef) 把唯一带 digest 的引用删掉，镜像 RepoDigests 被清空，
+// 检测落回「未知/误报」。因此这里只清「对向站」别名，保留当前站引用。
+// 清理失败不阻断更新（别名可能正被容器引用，忽略即可）。
+func CleanOtherHubAliases(ctx context.Context, cli *client.Client, pullRef string) {
+	host := hubcfg.Host()
+	if host == "" {
+		return
+	}
+	repo := pullRef
+	if i := strings.Index(repo, "/"); i >= 0 {
+		repo = repo[i+1:]
+	}
+	for _, t := range hubcfg.Targets() {
+		oh := t
+		if s, ok := strings.CutPrefix(t, "https://"); ok {
+			oh = s
+		} else if s, ok := strings.CutPrefix(t, "http://"); ok {
+			oh = s
+		}
+		if oh == host {
+			continue
+		}
+		alias := oh + "/" + repo
+		if _, err := cli.ImageRemove(ctx, alias, image.RemoveOptions{}); err == nil {
+			logx.Infof("清理对向加速站别名: %s", alias)
+		}
+	}
+}
 
 // AcceleratedPullRef 把 Docker Hub 镜像名改写为 hubURL 指定的自建加速站地址。
 // 返回 (改写后的引用, 是否改写)。仅对「本地 Docker 主机 + 匿名 + 无显式
