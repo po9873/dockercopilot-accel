@@ -33,10 +33,11 @@ hubStaleCheck=off 可单独关闭。
 锚点未命中（上游重构）时以非零码退出，让构建失败并通知维护者。
 
 此外根治「空 RepoDigests 漏报」：三台宿主均无法直连 docker.io(registry-1.docker.io
-UNREACHABLE)，空 RepoDigests 的镜像上游会回退到 docker.io 取远端 digest/构建时间，
-取不到就被 STALE 兜底误判为「已是最新」，远端真更新也检测不到。本补丁在复查前把
-digestURL 的 docker.io host 强制换成当前加速站 hubURL(Hostname()，按配置动态读取，
-不绑定具体站、可回源 docker.io)，既可达又数据一致。
+UNREACHABLE)，空 RepoDigests 的镜像上游回退到 docker.io 取远端构建时间、取不到时会被
+STALE 兜底误判为「已是最新」，远端真更新也检测不到。本补丁不做无条件改写——仅在
+IsStaleRemoteManifest 取不到远端构建时间（即 docker.io 直连不可达）且 manifestURL 指向
+docker.io、且用户配了加速站(hubcfg.Hostname() 非空)时，才用当前加速站 hubURL 回源重试一次；
+对 docker.io 可达或未配加速站的用户零影响。
 """
 
 import sys
@@ -49,22 +50,7 @@ STATE_FILE = Path("upstream/internal/module/hubrecheck.go")
 # 只锚定这一行，避免上游比对循环重构后补丁失配。
 ANCHOR = "\tstatus := StatusLatest\n"
 
-REPLACEMENT = """	// 根治漏报：三台宿主均无法直连 docker.io(registry-1.docker.io UNREACHABLE)。
-	// 空 RepoDigests 的镜像上游会回退到 docker.io 取远端 digest/构建时间，必然失败，
-	// 被 STALE 兜底误判为「已是最新」，导致远端真有更新也检测不到。强制把 digestURL
-	// 的 docker.io host 换成当前加速站 hubURL(可回源 docker.io)，既可达又数据一致。
-	if u := strings.Index(digestURL, "://"); u >= 0 {
-		rest := digestURL[u+3:]
-		if sp := strings.Index(rest, "/"); sp >= 0 {
-			lh := strings.ToLower(rest[:sp])
-			if lh == "docker.io" || lh == "registry-1.docker.io" || lh == "registry.docker.io" {
-				if hubHost := hubcfg.Hostname(); hubHost != "" {
-					digestURL = digestURL[:u+3] + hubHost + rest[sp:]
-				}
-			}
-		}
-	}
-	// 远端与本地不一致时，先强制刷新自建加速站 manifest 缓存再复查一次。
+REPLACEMENT = """	// 远端与本地不一致时，先强制刷新自建加速站 manifest 缓存再复查一次。
 	// KSpeeder 的 manifest TTL 不可调，缓存可能停留在几天前的旧 index：
 	// 用户刚更新完，本地是新 digest，检测却拿到旧 digest，于是「更新完又提示」。
 	// 复查后仍不一致才判定真更新；这里不做任何「抑制」，真更新不会被压掉。
@@ -215,13 +201,31 @@ func IsStaleRemoteManifest(manifestURL, remoteDigest, token string, localCreated
     if hit && !e.ok {
         ttl = 60 * time.Second
     }
-    if !hit || time.Since(e.at) > ttl {
-        created, ok := fetchRemoteImageCreated(manifestURL, token)
-        e = staleCheckEntry{at: time.Now(), created: created, ok: ok}
-        staleCheckMu.Lock()
-        staleCheckCache[key] = e
-        staleCheckMu.Unlock()
-    }
+	if !hit || time.Since(e.at) > ttl {
+		created, ok := fetchRemoteImageCreated(manifestURL, token)
+		// 根治漏报：仅当「manifestURL 指向 docker.io 且取不到远端构建时间（直连不可达）」时，
+		// 用当前加速站 hubURL 回源重试一次。对 docker.io 可达、或未配加速站的用户零影响——
+		// 不会强制改写任何 URL，正常路径仍走 docker.io。
+		if !ok {
+			if u := strings.Index(manifestURL, "://"); u >= 0 {
+				if sp := strings.Index(manifestURL[u+3:], "/"); sp >= 0 {
+					lh := strings.ToLower(manifestURL[u+3 : u+3+sp])
+					if lh == "docker.io" || lh == "registry-1.docker.io" || lh == "registry.docker.io" {
+						if hubHost := hubcfg.Hostname(); hubHost != "" {
+							retryURL := manifestURL[:u+3] + hubHost + manifestURL[u+3+sp:]
+							if created2, ok2 := fetchRemoteImageCreated(retryURL, token); ok2 {
+								created, ok = created2, ok2
+							}
+						}
+					}
+				}
+			}
+		}
+		e = staleCheckEntry{at: time.Now(), created: created, ok: ok}
+		staleCheckMu.Lock()
+		staleCheckCache[key] = e
+		staleCheckMu.Unlock()
+	}
     if !e.ok {
         // 远端数据不可验证时不报更新。不是永久抑制：60 秒后重试，
         // 加速站恢复且远端确实更新时照常报出。
