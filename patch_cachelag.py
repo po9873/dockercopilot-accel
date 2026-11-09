@@ -115,18 +115,7 @@ REPLACEMENT = """	// 远端与本地不一致时，先强制刷新自建加速�
 			}
 		}
 	}
-    // 复查后仍判定有更新时，先做「多站对比」：当前站 digest 与本地不一致，
-    // 很可能只是这一站缓存滞后。向 hubURL 里的所有站各取一次 digest，
-    // 任一站与本地 RepoDigests 一致即证明本地已是最新，与站点前后顺序无关。
-    // 然后再校验远端 manifest 是否「比本地还旧」（旧缓存）。
-    if needUpdate {
-        verifyKey := tokenCacheKey(image)
-        verifyToken, _ := i.lookupTokenCache(verifyKey)
-        if matched, host := AnyHubDigestMatches(digestURL, verifyToken, image.RepoDigests); matched {
-            needUpdate = false
-            logx.Infof("加速站缓存滞后已排除 [%s] 站 %s 的 digest 与本地一致", imageRef, host)
-        }
-    }
+    // 复查后仍判定有更新时，再校验远端 manifest 是否可信、是否「比本地还旧」。
     if needUpdate {
         verifyKey := tokenCacheKey(image)
         verifyToken, _ := i.lookupTokenCache(verifyKey)
@@ -147,7 +136,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -242,9 +230,8 @@ func IsStaleRemoteManifest(manifestURL, remoteDigest, token string, localCreated
         ttl = 60 * time.Second
     }
 	if !hit || time.Since(e.at) > ttl {
-		// 取 hubURL 所有站里最晚的构建时间：任一站缓存滞后都不会把
-		// 「其实有更新」判成旧缓存，也不依赖主备顺序。
-		created, ok := newestRemoteCreated(manifestURL, token)
+		// 单站语义（对齐原版）：只用当前检测所用的站，不做多站并行对比。
+		created, ok := fetchRemoteCreatedWithFallback(manifestURL, token)
 		e = staleCheckEntry{at: time.Now(), created: created, ok: ok}
 		staleCheckMu.Lock()
 		staleCheckCache[key] = e
@@ -407,134 +394,17 @@ func fetchRemoteCreatedWithFallback(manifestURL, token string) (time.Time, bool)
 // 与「本地镜像构建时间」对比，判断是否有更新。
 // 用途：本地 RepoDigests 为空（手动打标签、加速站别名清理、镜像导入等）时，
 // 上游原逻辑直接判「无法比对」永久漏报；改走构建时间对比即可恢复检测能力。
-// 远端取 hubURL 里**所有**加速站的最新构建时间，与站点先后顺序无关。
-// 返回 (newer, ok)：ok=false 表示所有站都取不到构建时间，调用方应保守判「未知」。
+// 远端即当前检测所用的站（hubURL 当前站），单站语义与原版一致。
+// 返回 (newer, ok)：ok=false 表示取不到构建时间，调用方应保守判「未知」。
 func RemoteNewerByCreated(manifestURL, token string, localCreated int64) (bool, bool) {
     if manifestURL == "" || localCreated <= 0 {
         return false, false
     }
-    created, ok := newestRemoteCreated(manifestURL, token)
+    created, ok := fetchRemoteCreatedWithFallback(manifestURL, token)
     if !ok {
         return false, false
     }
     return created.Unix() > localCreated, true
-}
-
-// probeAllTimeout 是多站并行取数据的整体上限：单站探测自身 5 秒超时，
-// 留出余量即可，避免某个慢站把整轮检测拖住。
-const probeAllTimeout = 8 * time.Second
-
-// hubURLsFor 把 manifestURL 展开成「hubURL 里每个站各一份」的候选 URL。
-// 判定依据只看 host 是否属于当前配置的 hubURL，不写死任何域名：
-//   - manifestURL 的 host 属于 hubURL -> 用它对应的 path 拼出所有站的 URL；
-//   - 不属于（ghcr.io / quay.io 等原站镜像）-> 只用原 URL 一个，行为不变。
-// 这样站点叫什么、配几个、谁在前，都不影响结论。
-func hubURLsFor(manifestURL string) []string {
-    u, err := url.Parse(manifestURL)
-    if err != nil || u.Host == "" {
-        return []string{manifestURL}
-    }
-    targets := hubcfg.Targets()
-    onHub := false
-    for _, t := range targets {
-        tu, e := url.Parse(t)
-        if e == nil && strings.EqualFold(tu.Hostname(), u.Hostname()) {
-            onHub = true
-            break
-        }
-    }
-    if !onHub || len(targets) == 0 {
-        return []string{manifestURL}
-    }
-    out := make([]string, 0, len(targets))
-    for _, t := range targets {
-        out = append(out, t+u.Path)
-    }
-    return out
-}
-
-// AnyHubDigestMatches 并行向 hubURL 所有站取同一 tag 的 digest。
-// 只要任一站返回的 digest 与本地 RepoDigests 之一相同，即证明本地已是最新——
-// 当前站 digest 不同可能只是它自己缓存滞后，不代表真有更新。
-// 返回 (是否命中, 命中的站)，站点顺序不影响结论。
-func AnyHubDigestMatches(manifestURL, token string, localRepoDigests []string) (bool, string) {
-    urls := hubURLsFor(manifestURL)
-    // 只有「一个站」时没有对比意义：当前站刚刚已经问过了，不必重复请求。
-    // 未配置 hubURL（直连 docker.io/ghcr.io）也走这条，完全不改变原有行为。
-    if len(urls) <= 1 || len(localRepoDigests) == 0 {
-        return false, ""
-    }
-    type probeRes struct {
-        host   string
-        digest string
-    }
-    ch := make(chan probeRes, len(urls))
-    for _, u := range urls {
-        go func(u string) {
-            dg, err := GetDigest(u, token)
-            if err != nil || dg == "" {
-                ch <- probeRes{}
-                return
-            }
-            host := ""
-            if pu, e := url.Parse(u); e == nil {
-                host = pu.Host
-            }
-            ch <- probeRes{host: host, digest: dg}
-        }(u)
-    }
-    timeout := time.After(probeAllTimeout)
-    for i := 0; i < len(urls); i++ {
-        select {
-        case r := <-ch:
-            if r.digest == "" {
-                continue
-            }
-            for _, local := range localRepoDigests {
-                if parts := strings.SplitN(local, "@", 2); len(parts) == 2 && parts[1] == r.digest {
-                    return true, r.host
-                }
-            }
-        case <-timeout:
-            return false, ""
-        }
-    }
-    return false, ""
-}
-
-// newestRemoteCreated 并行取 hubURL 所有站该 tag 的镜像构建时间，返回最晚的一个。
-// 为什么要取最晚：各站缓存进度不一致，旧站给出的 created 可能过期；
-// 取最晚既不会把「某站缓存旧」误判成「没有更新」，也不需要人工指定主备顺序。
-func newestRemoteCreated(manifestURL, token string) (time.Time, bool) {
-    urls := hubURLsFor(manifestURL)
-    if len(urls) == 0 {
-        return time.Time{}, false
-    }
-    type createdRes struct {
-        created time.Time
-        ok      bool
-    }
-    ch := make(chan createdRes, len(urls))
-    for _, u := range urls {
-        go func(u string) {
-            c, ok := fetchRemoteCreatedWithFallback(u, token)
-            ch <- createdRes{created: c, ok: ok}
-        }(u)
-    }
-    var newest time.Time
-    found := false
-    timeout := time.After(probeAllTimeout)
-    for i := 0; i < len(urls); i++ {
-        select {
-        case r := <-ch:
-            if r.ok && (!found || r.created.After(newest)) {
-                newest, found = r.created, true
-            }
-        case <-timeout:
-            return newest, found
-        }
-    }
-    return newest, found
 }
 '''
 

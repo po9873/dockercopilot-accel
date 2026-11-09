@@ -13,8 +13,12 @@
      （KSpeeder 对 <host>/alpine:latest 返回 401，必须写成
      <host>/library/alpine:latest）；仅对本地主机、匿名、无显式 registry
      前缀的镜像生效，GHCR / 私有 registry / 带凭据镜像保持原名。
-  2. 两处 ImagePull 改用加速站引用，拉完用 ImageTag 打回原名，并保留当前
-     加速站引用（它携带 RepoDigests，DC 检测靠它判断「已是最新」），
+  2. 两处 ImagePull 改用加速站引用，并一律按 digest 拉取：先强刷站点缓存、
+     再逐站取该 tag 当前 digest，按镜像构建时间从新到旧挑最新候选，
+     用 <站>/<repo>@<digest> 拉取；某站没有该内容就换下一站。
+     digest 是内容寻址，从机制上杜绝「点更新反而拉回站点缓存里的旧版」。
+     拉完用 ImageTag 打回原名，并保留当前加速站引用（它携带 RepoDigests，
+DC 检测靠它判断「已是最新」），
      只清理 hubURL 里「其它加速站」的同名别名（主备切换不会累积 <站域名>/
      别名、也不清空 RepoDigests）；后续 ImageInspect / ContainerCreate 完全不动；
   3. 拉取前调用自建加速站管理口 /api/cache/cleanup?force=1 强制刷新
@@ -47,6 +51,8 @@ ANCHOR_UPDATE = """	cli.NegotiateAPIVersion(ctx)
 REPL_UPDATE = """	cli.NegotiateAPIVersion(ctx)
 	// 与更新检测共用 hubURL 指定的自建加速站：ImagePull 传原始镜像名时，
 	// 请求由宿主机 daemon 直连 registry-1.docker.io，完全绕过加速站。
+	// 并且按 digest 拉取：tag 拉取可能命中站点缓存里的旧版（点更新反而降级），
+	// digest 是内容寻址，站点上没有该内容就换下一站，绝不会拉回旧版。
 	pullRef, viaHub := AcceleratedPullRef(imageNameAndTag, registryAuth, hostID)
 	if viaHub {
 		PurgeHubCache(ctx)
@@ -54,8 +60,13 @@ REPL_UPDATE = """	cli.NegotiateAPIVersion(ctx)
 		oldTaskProgress.DetailMsg = "正在拉取新镜像（自建加速站 " + pullRef + "）"
 		serviceContext.UpdateProgress(taskID, oldTaskProgress)
 	}
-	// 携带凭据拉取私有镜像；registryAuth 为空时等价于匿名拉取
-	reader, err := cli.ImagePull(ctx, pullRef, image.PullOptions{RegistryAuth: registryAuth})
+	reader, pullUsed, err := func() (io.ReadCloser, string, error) {
+		if !viaHub {
+			r, e := cli.ImagePull(ctx, pullRef, image.PullOptions{RegistryAuth: registryAuth})
+			return r, pullRef, e
+		}
+		return hubPullByDigest(ctx, cli, pullRef, registryAuth)
+	}()
 """
 
 ANCHOR_DECODE = """	err = decodePullResp(ctx, reader, serviceContext, taskID)
@@ -66,7 +77,7 @@ ANCHOR_DECODE = """	err = decodePullResp(ctx, reader, serviceContext, taskID)
 REPL_DECODE = """	err = decodePullResp(ctx, reader, serviceContext, taskID)
 	if err == nil && viaHub {
 		// 拉完用原名重新打标：后续 inspect / 重建容器仍使用原始镜像名。
-		if tagErr := cli.ImageTag(ctx, pullRef, imageNameAndTag); tagErr != nil {
+		if tagErr := cli.ImageTag(ctx, pullUsed, imageNameAndTag); tagErr != nil {
 			markTaskFailed(serviceContext, taskID, &oldTaskProgress, "镜像重新打标失败", tagErr)
 			logx.Errorf("Failed to tag image %s -> %s: %s", pullRef, imageNameAndTag, tagErr)
 			return tagErr
@@ -100,12 +111,19 @@ ANCHOR_SELF = """func pullImageForSelfUpdate(ctx context.Context, svcCtx *svc.Se
 REPL_SELF = """func pullImageForSelfUpdate(ctx context.Context, svcCtx *svc.ServiceContext, imageNameAndTag, registryAuth, taskID string) error {
 	svcCtx.DockerClient.NegotiateAPIVersion(ctx)
 	// 自更新同样必须走自建加速站，否则新版 DC 镜像自身也拉不下来。
+	// 同样按 digest 拉取，避免把站点缓存里的旧版拉回来覆盖当前版本。
 	pullRef, viaHub := AcceleratedPullRef(imageNameAndTag, registryAuth, "")
 	if viaHub {
 		PurgeHubCache(ctx)
 		logx.Infof("自更新镜像拉取改走自建加速站 [%s] -> %s", imageNameAndTag, pullRef)
 	}
-	reader, err := svcCtx.DockerClient.ImagePull(ctx, pullRef, image.PullOptions{RegistryAuth: registryAuth})
+	reader, pullUsed, err := func() (io.ReadCloser, string, error) {
+		if !viaHub {
+			r, e := svcCtx.DockerClient.ImagePull(ctx, pullRef, image.PullOptions{RegistryAuth: registryAuth})
+			return r, pullRef, e
+		}
+		return hubPullByDigest(ctx, svcCtx.DockerClient, pullRef, registryAuth)
+	}()
 	if err != nil {
 		return err
 	}
@@ -113,7 +131,7 @@ REPL_SELF = """func pullImageForSelfUpdate(ctx context.Context, svcCtx *svc.Serv
 		return err
 	}
 	if viaHub {
-		if tagErr := svcCtx.DockerClient.ImageTag(ctx, pullRef, imageNameAndTag); tagErr != nil {
+		if tagErr := svcCtx.DockerClient.ImageTag(ctx, pullUsed, imageNameAndTag); tagErr != nil {
 			return tagErr
 		}
 		// 同 UpdateContainerOnHost：保留当前加速站引用（携带 RepoDigests，
@@ -134,9 +152,15 @@ HELPER_GO = '''package utiles
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -287,6 +311,313 @@ func PurgeHubCache(ctx context.Context) {
 	}
 	defer res.Body.Close()
 	logx.Infof("自建加速站缓存已强制刷新: %s status=%d", target, res.StatusCode)
+}
+
+// hubPullByDigest 按 digest 拉取加速站镜像，按「远端构建时间从新到旧」逐站尝试。
+// 为什么不能按 tag 拉：tag 是站点自己解析的，缓存滞后时 tag 指向旧 digest，
+// 拉取会「成功地」把旧版装回来（实测 192.168.6.249 被这样降级过）。
+// digest 是内容寻址，站点上没有该内容就直接失败，由调用方换下一站，
+// 从机制上杜绝「点更新反而降级」。
+func hubPullByDigest(ctx context.Context, cli *client.Client, tagPullRef, registryAuth string) (io.ReadCloser, string, error) {
+	cands := HubDigestPullRefs(tagPullRef)
+	if len(cands) == 0 {
+		return nil, "", errors.New("加速站 digest 不可得，拒绝按 tag 拉取（避免拉回旧版）")
+	}
+	var lastErr error
+	for _, cand := range cands {
+		r, err := cli.ImagePull(ctx, cand, image.PullOptions{RegistryAuth: registryAuth})
+		if err == nil {
+			logx.Infof("按 digest 拉取成功: %s", cand)
+			return r, cand, nil
+		}
+		lastErr = err
+		logx.Infof("warn: 按 digest 拉取失败，换下一候选 %s: %v", cand, err)
+	}
+	return nil, "", lastErr
+}
+
+// HubDigestPullRefs 把加速站 tag 引用展开为「按 digest 拉取」的候选列表，
+// 并按各候选镜像的构建时间从新到旧排序，最新的排第一。
+//
+// 必须比构建时间：各站缓存进度不同，第一个站返回的 digest 很可能对应旧缓存，
+// 直接按它拉取就会「成功地」装回旧版。取所有候选里构建时间最新的，
+// 才能保证更新永远不降级。站点顺序只作为构建时间相同/取不到时的兜底，
+// 不决定结论；全程只读 hubURL，不写死任何域名。
+//
+// 调用方应先执行 PurgeHubCache 强刷站点 manifest 缓存，否则各站可能都还停在旧 tag。
+func HubDigestPullRefs(tagPullRef string) []string {
+	i := strings.Index(tagPullRef, "/")
+	if i <= 0 {
+		return nil
+	}
+	rest := tagPullRef[i+1:]
+	if j := strings.LastIndex(rest, "@"); j >= 0 {
+		rest = rest[:j]
+	}
+	repo, tag := rest, "latest"
+	if k := strings.LastIndex(rest, ":"); k > strings.LastIndex(rest, "/") {
+		repo, tag = rest[:k], rest[k+1:]
+	}
+	if repo == "" || tag == "" {
+		return nil
+	}
+
+	type hubCand struct {
+		ref     string
+		created time.Time
+		known   bool
+		order   int
+	}
+	targets := hubcfg.Targets()
+	ch := make(chan hubCand, len(targets))
+	for idx, t := range targets {
+		go func(idx int, t string) {
+			base := strings.TrimSuffix(t, "/")
+			token := hubAuthToken(base, repo)
+			dg := hubManifestDigest(base+"/v2/"+repo+"/manifests/"+tag, token)
+			if dg == "" {
+				ch <- hubCand{order: idx}
+				return
+			}
+			h := strings.TrimPrefix(strings.TrimPrefix(t, "https://"), "http://")
+			created, known := hubDigestCreated(base, repo, dg, token)
+			ch <- hubCand{ref: h + "/" + repo + "@" + dg, created: created, known: known, order: idx}
+		}(idx, t)
+	}
+
+	cands := make([]hubCand, 0, len(targets))
+	seen := map[string]bool{}
+	timeout := time.After(12 * time.Second)
+loop:
+	for i := 0; i < len(targets); i++ {
+		select {
+		case c := <-ch:
+			if c.ref == "" || seen[c.ref] {
+				continue
+			}
+			seen[c.ref] = true
+			cands = append(cands, c)
+		case <-timeout:
+			break loop
+		}
+	}
+	if len(cands) == 0 {
+		logx.Infof("warn: 所有加速站都取不到 digest: %s", tagPullRef)
+		return nil
+	}
+	sort.SliceStable(cands, func(a, b int) bool {
+		if cands[a].known != cands[b].known {
+			return cands[a].known
+		}
+		if cands[a].known && !cands[a].created.Equal(cands[b].created) {
+			return cands[a].created.After(cands[b].created)
+		}
+		return cands[a].order < cands[b].order
+	})
+	out := make([]string, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, c.ref)
+	}
+	return out
+}
+
+// hubAuthToken 取加速站的匿名 pull token：站不要求认证时返回空串，
+// 需要认证时按 WWW-Authenticate 的 realm/service 换一个匿名 token。
+// 必须支持这一步：KSpeeder 这类站对 docker.io 代理路径会先给 401 挑战，
+// 不带 token 连 manifest HEAD 都拿不到，更新会直接失败。
+func hubAuthToken(baseURL, repo string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v2/", nil)
+	if err != nil {
+		return ""
+	}
+	res, err := (&http.Client{Timeout: 6 * time.Second}).Do(req)
+	if err != nil {
+		return ""
+	}
+	res.Body.Close()
+	if res.StatusCode == http.StatusOK {
+		return ""
+	}
+	realm, service := parseBearerChallenge(res.Header.Get("Www-Authenticate"))
+	if realm == "" {
+		return ""
+	}
+	u := realm + "?service=" + url.QueryEscape(service) + "&scope=" + url.QueryEscape("repository:"+repo+":pull")
+	req2, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return ""
+	}
+	res2, err := (&http.Client{Timeout: 6 * time.Second}).Do(req2)
+	if err != nil {
+		return ""
+	}
+	defer res2.Body.Close()
+	if res2.StatusCode != http.StatusOK {
+		return ""
+	}
+	body, err := io.ReadAll(io.LimitReader(res2.Body, 1<<20))
+	if err != nil {
+		return ""
+	}
+	var m map[string]interface{}
+	if json.Unmarshal(body, &m) != nil {
+		return ""
+	}
+	if tok, _ := m["token"].(string); tok != "" {
+		return tok
+	}
+	tok, _ := m["access_token"].(string)
+	return tok
+}
+
+// parseBearerChallenge 解析 `WWW-Authenticate: Bearer realm="...",service="..."`。
+func parseBearerChallenge(ch string) (string, string) {
+	ch = strings.TrimSpace(ch)
+	if len(ch) < 7 || !strings.EqualFold(ch[:7], "bearer ") {
+		return "", ""
+	}
+	realm, service := "", ""
+	for _, p := range strings.Split(ch[7:], ",") {
+		kv := strings.SplitN(strings.TrimSpace(p), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		v := strings.Trim(kv[1], `"`)
+		switch strings.ToLower(kv[0]) {
+		case "realm":
+			realm = v
+		case "service":
+			service = v
+		}
+	}
+	return realm, service
+}
+
+// hubManifestDigest 取某站某个 tag 当前指向的 manifest digest。
+// 用 GET 而不是 HEAD：部分加速站对 HEAD 响应很慢甚至不返回头，
+// manifest 只有几 KB，GET 后直接丢弃 body 更稳。token 为空表示匿名放行。
+func hubManifestDigest(u, token string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return ""
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Accept", strings.Join([]string{
+		"application/vnd.oci.image.index.v1+json",
+		"application/vnd.docker.distribution.manifest.list.v2+json",
+		"application/vnd.docker.distribution.manifest.v2+json",
+		"application/vnd.oci.image.manifest.v1+json",
+	}, ", "))
+	res, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
+	if err != nil {
+		logx.Infof("warn: 取加速站 digest 失败 %s: %v", u, err)
+		return ""
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return ""
+	}
+	// 读掉少量 body 以便连接复用；manifest 本身很小，不影响耗时。
+	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 1<<20))
+	return strings.TrimSpace(res.Header.Get("Docker-Content-Digest"))
+}
+
+// hubDigestCreated 取某站某个 digest 对应镜像的构建时间（沿 manifest -> config blob）。
+// 用于在多站候选里挑「最新的那个」，避免按旧缓存的 digest 拉取导致降级。
+func hubDigestCreated(baseURL, repo, digest, token string) (time.Time, bool) {
+	accept := strings.Join([]string{
+		"application/vnd.oci.image.index.v1+json",
+		"application/vnd.docker.distribution.manifest.list.v2+json",
+		"application/vnd.docker.distribution.manifest.v2+json",
+		"application/vnd.oci.image.manifest.v1+json",
+	}, ", ")
+	getJSON := func(u string) (map[string]interface{}, bool) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return nil, false
+		}
+		req.Header.Set("Accept", accept)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		res, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+		if err != nil {
+			return nil, false
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			return nil, false
+		}
+		body, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
+		if err != nil {
+			return nil, false
+		}
+		var m map[string]interface{}
+		if json.Unmarshal(body, &m) != nil {
+			return nil, false
+		}
+		return m, true
+	}
+
+	top, ok := getJSON(baseURL + "/v2/" + repo + "/manifests/" + digest)
+	if !ok {
+		return time.Time{}, false
+	}
+	cfg := ""
+	if list, isList := top["manifests"].([]interface{}); isList && len(list) > 0 {
+		for _, item := range list {
+			m, _ := item.(map[string]interface{})
+			plat, _ := m["platform"].(map[string]interface{})
+			arch, _ := plat["architecture"].(string)
+			osName, _ := plat["os"].(string)
+			d, _ := m["digest"].(string)
+			if d != "" && arch == runtime.GOARCH && (osName == "" || osName == runtime.GOOS) {
+				cfg = d
+				break
+			}
+		}
+		if cfg == "" {
+			if first, ok := list[0].(map[string]interface{}); ok {
+				cfg, _ = first["digest"].(string)
+			}
+		}
+		if cfg == "" {
+			return time.Time{}, false
+		}
+		child, ok := getJSON(baseURL + "/v2/" + repo + "/manifests/" + cfg)
+		if !ok {
+			return time.Time{}, false
+		}
+		c, _ := child["config"].(map[string]interface{})
+		cfg, _ = c["digest"].(string)
+	} else {
+		c, _ := top["config"].(map[string]interface{})
+		cfg, _ = c["digest"].(string)
+	}
+	if cfg == "" {
+		return time.Time{}, false
+	}
+	blob, ok := getJSON(baseURL + "/v2/" + repo + "/blobs/" + cfg)
+	if !ok {
+		return time.Time{}, false
+	}
+	s, _ := blob["created"].(string)
+	if s == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // PurgeStaleHubImages 删掉「旧版本残留镜像」：不再被任何容器引用、且仍挂着
@@ -447,6 +778,22 @@ func imageInUseByContainer(cli *client.Client, imageID string) bool {
 }"""
 
 
+ANCHOR_SELF_IMPORT = """import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+"""
+
+REPL_SELF_IMPORT = """import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+"""
+
+
 def apply(path: Path, anchor: str, replacement: str, name: str) -> int:
     if not path.exists():
         print(f"[patch_pullviahub] 未找到 {path}", file=sys.stderr)
@@ -469,6 +816,7 @@ def main() -> int:
     rc |= apply(UPDATE, ANCHOR_UPDATE, REPL_UPDATE, "updatecontainer/pull")
     rc |= apply(UPDATE, ANCHOR_DECODE, REPL_DECODE, "updatecontainer/tag")
     rc |= apply(SELF, ANCHOR_SELF, REPL_SELF, "selfupdate/pull")
+    rc |= apply(SELF, ANCHOR_SELF_IMPORT, REPL_SELF_IMPORT, "selfupdate/import-io")
     rc |= apply(REMOVE, ANCHOR_REMOVE_IMPORT, REPL_REMOVE_IMPORT, "removeimage/import")
     rc |= apply(REMOVE, ANCHOR_REMOVE_BODY, REPL_REMOVE_BODY, "removeimage/force-fallback")
     if rc:
