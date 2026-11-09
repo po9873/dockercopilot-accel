@@ -229,21 +229,22 @@ func IsStaleRemoteManifest(manifestURL, remoteDigest, token string, localCreated
     if !e.ok {
         // 远端数据不可验证时不报更新。不是永久抑制：60 秒后重试，
         // 加速站恢复且远端确实更新时照常报出。
-        // 同时把当前站标记为「暂时不可验证」并立即失效：上游回源超时
-        // 往往是整站问题，下一轮检测会自动切到备站，不必等满 60 秒。
-        hubcfg.MarkCurrentUnverified("远端构建时间不可验证")
+        // 注意：这里不再冷却/切站。按「单个镜像取不到数据」去降权整站，
+        // 会让同一轮检测里其它镜像改用备站，而备站的该仓库缓存往往更旧，
+        // 结果把真更新判成「旧缓存」压掉（实测 qqaazz -> linkease 后
+        // dockercopilot 永远检不出更新）。站点选择只由健康探测决定。
         return true, "远端构建时间不可验证（加速站数据不完整），暂不报更新"
     }
     if e.created.Unix() > localCreated {
         return false, ""
     }
     // 远端 manifest 比本地镜像还旧：这是加速站 tag 缓存长期停在旧 index
-    // 的确凿证据。除了不报更新（避免点了更新反而拉回旧版），还要把该站
-    // 冷却降权，下一轮自动改用配置里的下一站，不再依赖这份旧缓存。
+    // 的确凿证据，不报更新（否则点了更新反而拉回旧版）。
+    // 只对「这一个仓库」生效，不冷却整站：按镜像降权整站会让后续镜像
+    // 被迫走备站并因此误判，反而漏报真更新。
     why := fmt.Sprintf("远端构建时间 %s 不晚于本地 %s（加速站旧缓存）",
         e.created.UTC().Format(time.RFC3339),
         time.Unix(localCreated, 0).UTC().Format(time.RFC3339))
-    hubcfg.MarkCurrentStale(why)
     return true, why
 }
 

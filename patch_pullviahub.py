@@ -160,14 +160,23 @@ import (
 // ImageRemove(pullRef) 把唯一带 digest 的引用删掉，镜像 RepoDigests 被清空，
 // 检测落回「未知/误报」。因此这里只清「对向站」别名，保留当前站引用。
 // 清理失败不阻断更新（别名可能正被容器引用，忽略即可）。
+//
+// 白名单必须取 pullRef 自带的 host，不能用 hubcfg.Host()：hubcfg 的当前站
+// 会随健康探测/候选失效在两次调用之间切走（拉取时是 A 站，清理时已切到 B 站），
+// 用「当前站」做白名单就会把刚拉取的 A 站引用当成「其它站」删掉，连带清空
+// 镜像 RepoDigests —— 检测随即退化为「本地无 repoDigest，无法比对」，
+// 界面永远显示无更新。以 pullRef 为准可彻底避免这种自伤。
 func CleanOtherHubAliases(ctx context.Context, cli *client.Client, pullRef string) {
-	host := hubcfg.Host()
-	if host == "" {
+	refHost := pullRef
+	if i := strings.Index(refHost, "/"); i >= 0 {
+		refHost = refHost[:i]
+	}
+	if refHost == "" {
 		return
 	}
-	repo := pullRef
-	if i := strings.Index(repo, "/"); i >= 0 {
-		repo = repo[i+1:]
+	repo := strings.TrimPrefix(pullRef, refHost+"/")
+	if repo == "" {
+		return
 	}
 	for _, t := range hubcfg.Targets() {
 		oh := t
@@ -176,7 +185,7 @@ func CleanOtherHubAliases(ctx context.Context, cli *client.Client, pullRef strin
 		} else if s, ok := strings.CutPrefix(t, "http://"); ok {
 			oh = s
 		}
-		if oh == host {
+		if oh == refHost {
 			continue
 		}
 		alias := oh + "/" + repo
