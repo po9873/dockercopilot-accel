@@ -290,3 +290,72 @@ func reachable(target string) (bool, string) {
 	}
 	return true, ""
 }
+
+// ---- 检测结论 -> 更新动作的 digest 桥接 ----
+//
+// 「更新成功却仍提示有更新」的根因：检测阶段按 A digest 判定并亮角标，
+// 点更新时加速站缓存可能已刷新成 B digest，更新按 B 拉取，容器镜像没换成
+// A；检测结果按镜像 ID 索引，ID 没变，角标自然继续亮。这里把检测确认的
+// digest 记下来，更新时优先按它拉取，保证「检测报哪一版就装哪一版」。
+// 记忆带 TTL（略长于 30 分钟检测周期），过期自动失效，不会长期误导。
+
+type remoteDigestRecord struct {
+	digest string
+	at     time.Time
+}
+
+var remoteDigestMu sync.RWMutex
+var remoteDigestMemo = map[string]remoteDigestRecord{}
+
+// NormalizeDigestKey 把任意镜像引用规范化成 "repo:tag" 作为桥接 key：
+// 去掉 scheme、digest、以及显式 registry host（含端口），让检测侧的
+// lswl/vertex:stable 与更新侧的 qqaazz.xxx/lswl/vertex:stable 落在同一 key。
+func NormalizeDigestKey(imageRef string) string {
+	s := imageRef
+	if a, ok := strings.CutPrefix(s, "https://"); ok {
+		s = a
+	} else if a, ok := strings.CutPrefix(s, "http://"); ok {
+		s = a
+	}
+	if i := strings.Index(s, "@"); i >= 0 {
+		s = s[:i]
+	}
+	if i := strings.Index(s, "/"); i >= 0 {
+		first := s[:i]
+		if strings.ContainsAny(first, ".:") || first == "localhost" {
+			s = s[i+1:]
+		}
+	}
+	if !strings.Contains(s, ":") {
+		s += ":latest"
+	}
+	return s
+}
+
+// RememberRemoteDigest 记录检测阶段确认「有更新」的远端 digest。
+func RememberRemoteDigest(imageRef, digest string) {
+	if digest == "" {
+		return
+	}
+	remoteDigestMu.Lock()
+	defer remoteDigestMu.Unlock()
+	remoteDigestMemo[NormalizeDigestKey(imageRef)] = remoteDigestRecord{digest: digest, at: time.Now()}
+}
+
+// ForgetRemoteDigest 清除某个镜像的检测 digest 记忆。
+func ForgetRemoteDigest(imageRef string) {
+	remoteDigestMu.Lock()
+	defer remoteDigestMu.Unlock()
+	delete(remoteDigestMemo, NormalizeDigestKey(imageRef))
+}
+
+// KnownRemoteDigest 返回最近一次检测确认的远端 digest；超过 35 分钟视为过期。
+func KnownRemoteDigest(imageRef string) string {
+	remoteDigestMu.RLock()
+	defer remoteDigestMu.RUnlock()
+	v, ok := remoteDigestMemo[NormalizeDigestKey(imageRef)]
+	if !ok || time.Since(v.at) > 35*time.Minute {
+		return ""
+	}
+	return v.digest
+}

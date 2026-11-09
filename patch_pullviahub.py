@@ -330,6 +330,8 @@ func hubPullByDigest(ctx context.Context, cli *client.Client, tagPullRef, regist
 		r, err := cli.ImagePull(ctx, cand, image.PullOptions{RegistryAuth: registryAuth})
 		if err == nil {
 			logx.Infof("按 digest 拉取成功: %s", cand)
+			// 结论已消费，清掉记忆；下一次检测会重新写入最新结论。
+			hubcfg.ForgetRemoteDigest(tagPullRef)
 			return r, cand, nil
 		}
 		lastErr = err
@@ -406,6 +408,26 @@ loop:
 	if len(cands) == 0 {
 		logx.Infof("warn: 所有加速站都取不到 digest: %s", tagPullRef)
 		return nil
+	}
+	// 检测阶段确认「有更新」的 digest 优先：点更新必须拉检测报出来的那一版。
+	// 加速站缓存刷新前后，更新时重新取的 tag digest 可能与检测时不同，
+	// 那样就会「更新成功却仍提示有更新」。这里把检测结论的候选排到最前，
+	// 每个站都试一遍（某站缓存未回源时不一定有这个 digest）。
+	if known := hubcfg.KnownRemoteDigest(repo + ":" + tag); known != "" {
+		for idx, t := range targets {
+			h := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(t, "https://"), "http://"), "/")
+			ref := h + "/" + repo + "@" + known
+			if !seen[ref] {
+				seen[ref] = true
+				cands = append(cands, hubCand{
+					ref:     ref,
+					created: time.Now().Add(24 * time.Hour),
+					known:   true,
+					order:   -1 - idx,
+				})
+			}
+		}
+		logx.Infof("更新沿用检测阶段确认的 digest: %s -> %s", tagPullRef, known)
 	}
 	sort.SliceStable(cands, func(a, b int) bool {
 		if cands[a].known != cands[b].known {

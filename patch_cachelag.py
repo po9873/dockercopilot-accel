@@ -74,6 +74,11 @@ REPLACEMENT_NODIGEST = """\tif len(image.RepoDigests) == 0 {
 \t\t\t} else {
 \t\t\t\tlogx.Debugf("镜像已是最新（按构建时间比对，本地无 repoDigest）[%s]", imageRef)
 \t\t\t}
+\t\t\tif newer && remoteDigest != "" {
+\t\t\t\thubcfg.RememberRemoteDigest(imageRef, remoteDigest)
+\t\t\t} else {
+\t\t\t\thubcfg.ForgetRemoteDigest(imageRef)
+\t\t\t}
 \t\t\ti.setResult(image.ID, ImageCheckList{NeedUpdate: newer, Status: status})
 \t\t\treturn
 \t\t}
@@ -124,6 +129,14 @@ REPLACEMENT = """	// 远端与本地不一致时，先强制刷新自建加速�
             logx.Infof("加速站疑似更新已排除 [%s] %s", imageRef, why)
         }
     }
+	// 把本轮确认的远端 digest 交给更新流程：点「更新」必须拉检测报出来的
+	// 这一版，否则加速站缓存刷新前后两处取到的 digest 不同，就会
+	// 「更新成功却仍提示有更新」。判为已是最新时清掉记忆，避免误导。
+	if needUpdate && remoteDigest != "" {
+		hubcfg.RememberRemoteDigest(imageRef, remoteDigest)
+	} else {
+		hubcfg.ForgetRemoteDigest(imageRef)
+	}
 	status := StatusLatest
 """
 
@@ -415,6 +428,13 @@ def main() -> int:
         return 1
 
     text = CHECKUPDATE.read_text(encoding="utf-8").replace("\r\n", "\n")
+    # 检测结论要交给更新流程，checkupdate.go 需要 hubcfg 包
+    imp = '\t"github.com/l429609201/dockerCopilot/internal/types"\n'
+    if text.count(imp) != 1:
+        print('[patch_cachelag] checkupdate.go import 锚点异常', file=sys.stderr)
+        return 1
+    text = text.replace(imp, '\t"github.com/l429609201/dockerCopilot/internal/hubcfg"\n' + imp)
+
     count = text.count(ANCHOR)
     if count != 1:
         print(
