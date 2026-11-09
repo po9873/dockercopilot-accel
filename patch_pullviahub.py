@@ -78,7 +78,8 @@ REPL_DECODE = """	err = decodePullResp(ctx, reader, serviceContext, taskID)
 		logx.Infof("加速站引用已保留（携带 RepoDigests，保证检测可用）: %s", pullRef)
 		// 换源之后，上一版镜像上的旧加速站 tag 不会自动转移，会永久占着
 		// 几百 MB 且界面上删不掉。这里顺手清掉，刚拉的这张用 keepID 保护。
-		if ins, ierr := cli.ImageInspect(ctx, imageNameAndTag); ierr == nil {
+		// docker client v27 没有 ImageInspect，只有 ImageInspectWithRaw。
+		if ins, _, ierr := cli.ImageInspectWithRaw(ctx, imageNameAndTag); ierr == nil {
 			PurgeStaleHubImages(ctx, cli, ins.ID)
 		}
 	}
@@ -121,7 +122,7 @@ REPL_SELF = """func pullImageForSelfUpdate(ctx context.Context, svcCtx *svc.Serv
 		logx.Infof("自更新：加速站引用已保留（携带 RepoDigests）: %s", pullRef)
 		// 同 UpdateContainerOnHost：清掉旧版镜像上的历史加速站引用。
 		// 自更新时新镜像尚未被容器引用，必须用 keepID 显式保护。
-		if ins, ierr := svcCtx.DockerClient.ImageInspect(ctx, imageNameAndTag); ierr == nil {
+		if ins, _, ierr := svcCtx.DockerClient.ImageInspectWithRaw(ctx, imageNameAndTag); ierr == nil {
 			PurgeStaleHubImages(ctx, svcCtx.DockerClient, ins.ID)
 		}
 	}
@@ -419,7 +420,7 @@ REPL_REMOVE_BODY = """	rmCtx := context.Background()
 // imageInUseByContainer 判断镜像是否被任何容器（含已停止）引用。
 // 查不到镜像信息或列举容器失败时返回 true（保守处理，绝不放行强删）。
 func imageInUseByContainer(cli *client.Client, imageID string) bool {
-	ins, ierr := cli.ImageInspect(context.Background(), imageID)
+	ins, _, ierr := cli.ImageInspectWithRaw(context.Background(), imageID)
 	if ierr != nil {
 		return true
 	}
