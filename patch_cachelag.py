@@ -50,6 +50,39 @@ STATE_FILE = Path("upstream/internal/module/hubrecheck.go")
 # 只锚定这一行，避免上游比对循环重构后补丁失配。
 ANCHOR = "\tstatus := StatusLatest\n"
 
+# 上游原生分支：本地无 RepoDigests 直接判「无法比对」。
+# 这是「digest 引用一被清空就永久检测不到更新」的根因，改为按构建时间对比。
+ANCHOR_NODIGEST = """\tif len(image.RepoDigests) == 0 {
+\t\t// 本地构建、未推送过的镜像没有 RepoDigests，无法比对，属正常情况
+\t\tlogx.Debugf("本地无 repoDigest，跳过比对 [%s]", imageRef)
+\t\tmarkUnknown("本地无 repoDigest，无法比对")
+\t\treturn
+\t}
+"""
+
+REPLACEMENT_NODIGEST = """\tif len(image.RepoDigests) == 0 {
+\t\t// 本地 RepoDigests 为空（手动打标签、加速站别名清理、镜像导入等）时，
+\t\t// 不再直接判「无法比对」：改用构建时间对比，完全不读本地 RepoDigests。
+\t\t// 远端 tag 指向镜像的构建时间晚于本地镜像即为有更新，早于/等于则已是最新。
+\t\t// 这样即便本地 digest 引用被清空，检测依然有效，不会永久漏报。
+\t\tfallbackToken, _ := i.lookupTokenCache(tokenCacheKey(image))
+\t\tif newer, ok := RemoteNewerByCreated(digestURL, fallbackToken, image.Created); ok {
+\t\t\tstatus := StatusLatest
+\t\t\tif newer {
+\t\t\t\tlogx.Infof("镜像有更新（按构建时间比对，本地无 repoDigest）[%s]", imageRef)
+\t\t\t\tstatus = StatusNeedUpdate
+\t\t\t} else {
+\t\t\t\tlogx.Debugf("镜像已是最新（按构建时间比对，本地无 repoDigest）[%s]", imageRef)
+\t\t\t}
+\t\t\ti.setResult(image.ID, ImageCheckList{NeedUpdate: newer, Status: status})
+\t\t\treturn
+\t\t}
+\t\tlogx.Debugf("本地无 repoDigest 且远端构建时间不可得，无法比对 [%s]", imageRef)
+\t\tmarkUnknown("本地无 repoDigest 且远端构建时间不可得，无法比对")
+\t\treturn
+\t}
+"""
+
 REPLACEMENT = """	// 远端与本地不一致时，先强制刷新自建加速站 manifest 缓存再复查一次。
 	// KSpeeder 的 manifest TTL 不可调，缓存可能停留在几天前的旧 index：
 	// 用户刚更新完，本地是新 digest，检测却拿到旧 digest，于是「更新完又提示」。
@@ -202,25 +235,7 @@ func IsStaleRemoteManifest(manifestURL, remoteDigest, token string, localCreated
         ttl = 60 * time.Second
     }
 	if !hit || time.Since(e.at) > ttl {
-		created, ok := fetchRemoteImageCreated(manifestURL, token)
-		// 根治漏报：仅当「manifestURL 指向 docker.io 且取不到远端构建时间（直连不可达）」时，
-		// 用当前加速站 hubURL 回源重试一次。对 docker.io 可达、或未配加速站的用户零影响——
-		// 不会强制改写任何 URL，正常路径仍走 docker.io。
-		if !ok {
-			if u := strings.Index(manifestURL, "://"); u >= 0 {
-				if sp := strings.Index(manifestURL[u+3:], "/"); sp >= 0 {
-					lh := strings.ToLower(manifestURL[u+3 : u+3+sp])
-					if lh == "docker.io" || lh == "registry-1.docker.io" || lh == "registry.docker.io" {
-						if hubHost := hubcfg.Hostname(); hubHost != "" {
-							retryURL := manifestURL[:u+3] + hubHost + manifestURL[u+3+sp:]
-							if created2, ok2 := fetchRemoteImageCreated(retryURL, token); ok2 {
-								created, ok = created2, ok2
-							}
-						}
-					}
-				}
-			}
-		}
+		created, ok := fetchRemoteCreatedWithFallback(manifestURL, token)
 		e = staleCheckEntry{at: time.Now(), created: created, ok: ok}
 		staleCheckMu.Lock()
 		staleCheckCache[key] = e
@@ -346,6 +361,54 @@ func fetchRemoteImageCreated(manifestURL, token string) (time.Time, bool) {
     }
     return t, true
 }
+
+// fetchRemoteCreatedWithFallback 取远端镜像构建时间，带条件回退：
+// 仅当 manifestURL 指向 docker.io 且直连取不到数据（内网不可达/超时）时，
+// 才用当前加速站 hubURL 回源重试一次；其它情况保持原 URL 不变。
+// 对 docker.io 可达、或未配加速站的用户零影响。
+func fetchRemoteCreatedWithFallback(manifestURL, token string) (time.Time, bool) {
+    created, ok := fetchRemoteImageCreated(manifestURL, token)
+    if ok {
+        return created, true
+    }
+    u := strings.Index(manifestURL, "://")
+    if u < 0 {
+        return time.Time{}, false
+    }
+    sp := strings.Index(manifestURL[u+3:], "/")
+    if sp < 0 {
+        return time.Time{}, false
+    }
+    lh := strings.ToLower(manifestURL[u+3 : u+3+sp])
+    if lh != "docker.io" && lh != "registry-1.docker.io" && lh != "registry.docker.io" {
+        return time.Time{}, false
+    }
+    hubHost := hubcfg.Hostname()
+    if hubHost == "" {
+        return time.Time{}, false
+    }
+    retryURL := manifestURL[:u+3] + hubHost + manifestURL[u+3+sp:]
+    if c2, ok2 := fetchRemoteImageCreated(retryURL, token); ok2 {
+        return c2, true
+    }
+    return time.Time{}, false
+}
+
+// RemoteNewerByCreated 完全不读本地 RepoDigests，改用「远端 tag 指向镜像的构建时间」
+// 与「本地镜像构建时间」对比，判断是否有更新。
+// 用途：本地 RepoDigests 为空（手动打标签、加速站别名清理、镜像导入等）时，
+// 上游原逻辑直接判「无法比对」永久漏报；改走构建时间对比即可恢复检测能力。
+// 返回 (newer, ok)：ok=false 表示远端构建时间取不到，调用方应保守判「未知」。
+func RemoteNewerByCreated(manifestURL, token string, localCreated int64) (bool, bool) {
+    if manifestURL == "" || localCreated <= 0 {
+        return false, false
+    }
+    created, ok := fetchRemoteCreatedWithFallback(manifestURL, token)
+    if !ok {
+        return false, false
+    }
+    return created.Unix() > localCreated, true
+}
 '''
 
 
@@ -363,7 +426,22 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    CHECKUPDATE.write_text(text.replace(ANCHOR, REPLACEMENT), encoding="utf-8", newline="\n")
+    text = text.replace(ANCHOR, REPLACEMENT)
+
+    # 「本地无 RepoDigests -> 直接判未知」是永久漏报的根因：
+    # 只要本地 digest 引用被清掉（别名清理、手动打标签、镜像导入），
+    # 检测就永远返回 unknown，界面再也不提示更新。
+    ndCount = text.count(ANCHOR_NODIGEST)
+    if ndCount != 1:
+        print(
+            f"[patch_cachelag] 空 RepoDigests 锚点匹配到 {ndCount} 次（期望 1 次），"
+            "上游 checkupdate.go 可能已重构，请手动核对后更新本脚本",
+            file=sys.stderr,
+        )
+        return 1
+    text = text.replace(ANCHOR_NODIGEST, REPLACEMENT_NODIGEST)
+
+    CHECKUPDATE.write_text(text, encoding="utf-8", newline="\n")
     STATE_FILE.write_text(RECHECK_GO, encoding="utf-8", newline="\n")
     print("[patch_cachelag] 缓存滞后复查确认补丁已应用（不抑制任何真更新）")
     return 0
