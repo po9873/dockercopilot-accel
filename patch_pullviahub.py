@@ -42,6 +42,7 @@ UPDATE = Path("upstream/internal/utiles/updatecontainer.go")
 SELF = Path("upstream/internal/utiles/selfupdate.go")
 HELPER = Path("upstream/internal/utiles/hubpull.go")
 REMOVE = Path("upstream/internal/utiles/removeimage.go")
+HELPER2 = Path("upstream/internal/utiles/helper.go")
 
 ANCHOR_UPDATE = """	cli.NegotiateAPIVersion(ctx)
 	// 携带凭据拉取私有镜像；registryAuth 为空时等价于匿名拉取
@@ -164,6 +165,7 @@ import (
 	"strings"
 	"time"
 
+	ref "github.com/distribution/reference"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
@@ -620,6 +622,92 @@ func hubDigestCreated(baseURL, repo, digest, token string) (time.Time, bool) {
 	return t, true
 }
 
+// looksLikeImageID 判断字符串是否是「用镜像 ID 创建的容器」留下的纯十六进制 ID。
+// 这类字符串能被 reference 库当成合法仓库名解析，但补成 tag 会造出
+// 07a5582f9e6c:latest 这种莫名其妙的引用，必须排除。
+func looksLikeImageID(s string) bool {
+	if len(s) != 12 && len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// repairMissingImageTags 给「容器在用、但镜像本身已经没有任何 tag」的镜像补回
+// 容器创建时使用的名字（取自 ContainerInspect.Config.Image）。
+//
+// 为什么需要：旧版 hubpull 打回原名后又删掉同名临时引用，会把镜像唯一的 tag
+// 一起删掉，容器靠镜像 ID 继续运行，DC 列表于是显示 tag=None，手动删除也被
+// dockerd 拒绝。按 digest 拉取的新版不会再制造这种镜像，但历史遗留、以及
+// 手动 rmi/tag 操作仍可能产生。补的 tag 就是容器原本的名字，不新增无关别名。
+// 这一步不依赖 hubURL，没配加速站的用户同样生效。
+func repairMissingImageTags(ctx context.Context, cli *client.Client) {
+	imgs, err := cli.ImageList(ctx, image.ListOptions{All: true})
+	if err != nil {
+		return
+	}
+	need := map[string]bool{}
+	for _, im := range imgs {
+		hasTag := false
+		for _, t := range im.RepoTags {
+			if t != "" && !strings.Contains(t, "<none>") {
+				hasTag = true
+				break
+			}
+		}
+		if !hasTag {
+			need[strings.TrimPrefix(im.ID, "sha256:")] = true
+		}
+	}
+	if len(need) == 0 {
+		return
+	}
+	ctns, cerr := cli.ContainerList(ctx, container.ListOptions{All: true})
+	if cerr != nil {
+		return
+	}
+	fixed := map[string]bool{}
+	for _, c := range ctns {
+		id := strings.TrimPrefix(c.ImageID, "sha256:")
+		if !need[id] || fixed[id] {
+			continue
+		}
+		ins, ierr := cli.ContainerInspect(ctx, c.ID)
+		if ierr != nil || ins.Config == nil {
+			continue
+		}
+		src := ins.Config.Image
+		if looksLikeImageID(src) || strings.Contains(src, "<none>") {
+			continue
+		}
+		parsed, perr := ref.ParseNormalizedNamed(src)
+		if perr != nil {
+			continue
+		}
+		name := ref.FamiliarName(parsed)
+		if name == "" {
+			continue
+		}
+		tag := "latest"
+		if tagged, ok := parsed.(ref.Tagged); ok {
+			tag = tagged.Tag()
+		}
+		target := name + ":" + tag
+		if terr := cli.ImageTag(ctx, c.ImageID, target); terr == nil {
+			short := id
+			if len(short) > 12 {
+				short = short[:12]
+			}
+			logx.Infof("已补回缺失的镜像 tag（容器创建名）: %s -> %s", short, target)
+			fixed[id] = true
+		}
+	}
+}
+
 // PurgeStaleHubImages 删掉「旧版本残留镜像」：不再被任何容器引用、且仍挂着
 // 加速站前缀 tag 的整张镜像。
 //
@@ -633,6 +721,10 @@ func hubDigestCreated(baseURL, repo, digest, token string) (time.Time, bool) {
 // 安全性：keepID 是刚拉取的新镜像，无论有没有容器引用都不删；其余只删
 // 「无任何容器（含已停止）引用」的，正在用的版本永远不碰。
 func PurgeStaleHubImages(ctx context.Context, cli *client.Client, keepID string) {
+	// 先补回「容器在用却没有 tag」的历史镜像，不依赖 hubURL、不受下面
+	// hosts 为空的提前返回影响。
+	repairMissingImageTags(ctx, cli)
+
 	hosts := make([]string, 0, 4)
 	for _, t := range hubcfg.Targets() {
 		h := t
@@ -793,6 +885,37 @@ REPL_SELF_IMPORT = """import (
 	"strings"
 """
 
+# 容器重建成功之后再清一次旧镜像。拉取后那次清理发生在重建之前：旧容器还
+# 引用着旧镜像，被 inUse 跳过；原 tag 又已经转移给新镜像，旧镜像于是以
+# <none> / tag=None 的形态留在列表里，直到下一次更新才被清掉。
+ANCHOR_UPDATE_DONE = """	oldTaskProgress.Message = "更新成功"
+	oldTaskProgress.DetailMsg = "更新成功"
+	oldTaskProgress.Percentage = 100
+	oldTaskProgress.IsDone = true
+	serviceContext.UpdateProgress(taskID, oldTaskProgress)"""
+
+REPL_UPDATE_DONE = """	// 重建完成、新容器已稳定运行后再清一次旧版镜像。保留旧容器备份时，
+	// 旧镜像仍在被引用，PurgeStaleHubImages 会自行跳过，绝不强删。
+	if ins, _, ierr := cli.ImageInspectWithRaw(context.Background(), imageNameAndTag); ierr == nil {
+		PurgeStaleHubImages(context.Background(), cli, ins.ID)
+	}
+
+	oldTaskProgress.Message = "更新成功"
+	oldTaskProgress.DetailMsg = "更新成功"
+	oldTaskProgress.Percentage = 100
+	oldTaskProgress.IsDone = true
+	serviceContext.UpdateProgress(taskID, oldTaskProgress)"""
+
+ANCHOR_HELPER_DONE = """	logx.Infof("[helper] ✅ DC 自我更新成功！新容器 %s 已启动并运行正常", targetName)"""
+
+REPL_HELPER_DONE = """	logx.Infof("[helper] ✅ DC 自我更新成功！新容器 %s 已启动并运行正常", targetName)
+
+	// 自更新重建完成后同样再清一次：主容器拉取后那次清理时旧 DC 容器
+	// 仍在引用旧镜像，被跳过；此刻旧容器已删除，无引用旧镜像可以清掉。
+	if ins, _, ierr := cli.ImageInspectWithRaw(ctx, newImage); ierr == nil {
+		PurgeStaleHubImages(ctx, cli, ins.ID)
+	}"""
+
 
 def apply(path: Path, anchor: str, replacement: str, name: str) -> int:
     if not path.exists():
@@ -819,6 +942,8 @@ def main() -> int:
     rc |= apply(SELF, ANCHOR_SELF_IMPORT, REPL_SELF_IMPORT, "selfupdate/import-io")
     rc |= apply(REMOVE, ANCHOR_REMOVE_IMPORT, REPL_REMOVE_IMPORT, "removeimage/import")
     rc |= apply(REMOVE, ANCHOR_REMOVE_BODY, REPL_REMOVE_BODY, "removeimage/force-fallback")
+    rc |= apply(UPDATE, ANCHOR_UPDATE_DONE, REPL_UPDATE_DONE, "updatecontainer/after-recreate")
+    rc |= apply(HELPER2, ANCHOR_HELPER_DONE, REPL_HELPER_DONE, "helper/after-recreate")
     if rc:
         return rc
     if not HELPER.parent.is_dir():
