@@ -165,7 +165,6 @@ import (
 	"strings"
 	"time"
 
-	ref "github.com/distribution/reference"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
@@ -644,92 +643,6 @@ func hubDigestCreated(baseURL, repo, digest, token string) (time.Time, bool) {
 	return t, true
 }
 
-// looksLikeImageID 判断字符串是否是「用镜像 ID 创建的容器」留下的纯十六进制 ID。
-// 这类字符串能被 reference 库当成合法仓库名解析，但补成 tag 会造出
-// 07a5582f9e6c:latest 这种莫名其妙的引用，必须排除。
-func looksLikeImageID(s string) bool {
-	if len(s) != 12 && len(s) != 64 {
-		return false
-	}
-	for _, r := range s {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
-			return false
-		}
-	}
-	return true
-}
-
-// repairMissingImageTags 给「容器在用、但镜像本身已经没有任何 tag」的镜像补回
-// 容器创建时使用的名字（取自 ContainerInspect.Config.Image）。
-//
-// 为什么需要：旧版 hubpull 打回原名后又删掉同名临时引用，会把镜像唯一的 tag
-// 一起删掉，容器靠镜像 ID 继续运行，DC 列表于是显示 tag=None，手动删除也被
-// dockerd 拒绝。按 digest 拉取的新版不会再制造这种镜像，但历史遗留、以及
-// 手动 rmi/tag 操作仍可能产生。补的 tag 就是容器原本的名字，不新增无关别名。
-// 这一步不依赖 hubURL，没配加速站的用户同样生效。
-func repairMissingImageTags(ctx context.Context, cli *client.Client) {
-	imgs, err := cli.ImageList(ctx, image.ListOptions{All: true})
-	if err != nil {
-		return
-	}
-	need := map[string]bool{}
-	for _, im := range imgs {
-		hasTag := false
-		for _, t := range im.RepoTags {
-			if t != "" && !strings.Contains(t, "<none>") {
-				hasTag = true
-				break
-			}
-		}
-		if !hasTag {
-			need[strings.TrimPrefix(im.ID, "sha256:")] = true
-		}
-	}
-	if len(need) == 0 {
-		return
-	}
-	ctns, cerr := cli.ContainerList(ctx, container.ListOptions{All: true})
-	if cerr != nil {
-		return
-	}
-	fixed := map[string]bool{}
-	for _, c := range ctns {
-		id := strings.TrimPrefix(c.ImageID, "sha256:")
-		if !need[id] || fixed[id] {
-			continue
-		}
-		ins, ierr := cli.ContainerInspect(ctx, c.ID)
-		if ierr != nil || ins.Config == nil {
-			continue
-		}
-		src := ins.Config.Image
-		if looksLikeImageID(src) || strings.Contains(src, "<none>") {
-			continue
-		}
-		parsed, perr := ref.ParseNormalizedNamed(src)
-		if perr != nil {
-			continue
-		}
-		name := ref.FamiliarName(parsed)
-		if name == "" {
-			continue
-		}
-		tag := "latest"
-		if tagged, ok := parsed.(ref.Tagged); ok {
-			tag = tagged.Tag()
-		}
-		target := name + ":" + tag
-		if terr := cli.ImageTag(ctx, c.ImageID, target); terr == nil {
-			short := id
-			if len(short) > 12 {
-				short = short[:12]
-			}
-			logx.Infof("已补回缺失的镜像 tag（容器创建名）: %s -> %s", short, target)
-			fixed[id] = true
-		}
-	}
-}
-
 // PurgeStaleHubImages 删掉「旧版本残留镜像」：不再被任何容器引用、且仍挂着
 // 加速站前缀 tag 的整张镜像。
 //
@@ -743,10 +656,6 @@ func repairMissingImageTags(ctx context.Context, cli *client.Client) {
 // 安全性：keepID 是刚拉取的新镜像，无论有没有容器引用都不删；其余只删
 // 「无任何容器（含已停止）引用」的，正在用的版本永远不碰。
 func PurgeStaleHubImages(ctx context.Context, cli *client.Client, keepID string) {
-	// 先补回「容器在用却没有 tag」的历史镜像，不依赖 hubURL、不受下面
-	// hosts 为空的提前返回影响。
-	repairMissingImageTags(ctx, cli)
-
 	hosts := make([]string, 0, 4)
 	for _, t := range hubcfg.Targets() {
 		h := t
