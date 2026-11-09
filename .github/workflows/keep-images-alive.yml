@@ -1,0 +1,140 @@
+name: keep-dockerhub-images-alive
+
+# 保证 Docker Hub 上 po9873 名下所有镜像不会因「6 个月无 pull/push」被清理。
+#
+# 每月对每个 tag 做一次 manifest GET —— Docker 官方定义里一次 GET manifest 就是
+# 一次 pull，6 个月计时归零。全程只读 manifest、不重新构建、不改 tag 指向，
+# 所以不会给 DC 制造「假更新」。
+#
+# 三段式，保活优先（即使后面同步超时，计时已经全部归零）：
+#   1. 全量 manifest GET -> 计时归零，并分出「在 / 不在」两组；
+#   2. 把每个镜像同步一份到 GHCR（无清理策略）作为永久副本，仅当副本缺失
+#      或 digest 不同时才 copy；首次运行较慢，之后每月只发 manifest 请求；
+#   3. Docker Hub 上已丢但 GHCR 还在 -> 原样 copy 回去（digest 不变，自动修复）；
+#      两边都没有 -> 明确失败报警，需从 GitHub 源码重建推回。
+#
+# 仓库与 tag 全部由 Docker Hub 公开 API 分页枚举，新增镜像自动纳入，不用手工清单。
+on:
+  push:
+    paths:
+      - .github/workflows/keep-images-alive.yml   # 改本文件即自动跑一次，便于验证
+  schedule:
+    - cron: '0 3 1 * *'                          # 每月 1 号 03:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: keep-images-alive
+  cancel-in-progress: false
+
+permissions:
+  contents: write     # 每月一次空提交，防止 GitHub 禁用 60 天无活动仓库的定时任务
+  packages: write     # 推 GHCR
+
+env:
+  HUB_USER: po9873
+  DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+  DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Install crane
+        run: go install github.com/google/go-containerregistry/cmd/crane@latest
+
+      - name: Login registries
+        run: |
+          set -euo pipefail
+          echo '${{ secrets.GITHUB_TOKEN }}' | crane auth login ghcr.io -u '${{ github.actor }}' --password-stdin
+          if [ -n "$DH_USER" ] && [ -n "$DH_TOKEN" ]; then
+            echo "$DH_TOKEN" | crane auth login docker.io -u "$DH_USER" --password-stdin
+          else
+            echo '::warning::未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN，只做匿名保活且无法自动修复'
+          fi
+
+      - name: Enumerate / keep alive / mirror / restore
+        id: run
+        run: |
+          set -uo pipefail
+          U="$HUB_USER"
+          : > repos.txt; : > tags.txt
+
+          url="https://hub.docker.com/v2/repositories/$U/?page_size=100"
+          while [ -n "$url" ]; do
+            j=$(curl -fsS "$url") || { echo '::error::枚举 Docker Hub 仓库失败'; exit 1; }
+            echo "$j" | jq -r '.results[].name' >> repos.txt
+            url=$(echo "$j" | jq -r '.next // empty')
+          done
+          sort -u repos.txt -o repos.txt
+
+          while read -r r; do
+            [ -z "$r" ] && continue
+            u="https://hub.docker.com/v2/repositories/$U/$r/tags?page_size=100"
+            while [ -n "$u" ]; do
+              j=$(curl -fsS "$u") || break
+              echo "$j" | jq -r --arg r "$r" '.results[].name | "\($r):\(.)"' >> tags.txt
+              u=$(echo "$j" | jq -r '.next // empty')
+            done
+          done < repos.txt
+          sort -u tags.txt -o tags.txt
+          echo "枚举完成：仓库 $(wc -l < repos.txt) 个 / tag $(wc -l < tags.txt) 个"
+
+          : > alive.txt; : > missing.txt
+          kept=0; missing=0
+          while read -r ref; do
+            [ -z "$ref" ] && continue
+            if crane manifest "docker.io/$U/$ref" >/dev/null 2>&1; then
+              echo "$ref" >> alive.txt; kept=$((kept+1))
+            else
+              echo "$ref" >> missing.txt; missing=$((missing+1))
+            fi
+          done < tags.txt
+          echo "保活成功 $kept 个 tag；Hub 上缺失 $missing 个"
+
+          mirrored=0
+          while read -r ref; do
+            [ -z "$ref" ] && continue
+            src="docker.io/$U/$ref"; dst="ghcr.io/$U/$ref"
+            sd=$(crane digest "$src" 2>/dev/null || true)
+            dd=$(crane digest "$dst" 2>/dev/null || true)
+            if [ -n "$sd" ] && [ "$sd" != "$dd" ]; then
+              if crane copy "$src" "$dst"; then
+                mirrored=$((mirrored+1))
+              else
+                echo "::warning::GHCR 副本同步失败 $ref（不影响本次保活）"
+              fi
+            fi
+          done < alive.txt
+
+          restored=0; fail=0
+          while read -r ref; do
+            [ -z "$ref" ] && continue
+            src="docker.io/$U/$ref"; dst="ghcr.io/$U/$ref"
+            if [ -n "$DH_USER" ] && crane manifest "$dst" >/dev/null 2>&1 && crane copy "$dst" "$src"; then
+              restored=$((restored+1))
+            else
+              echo "::error::$ref 两边都不存在或无法回推，需从 GitHub 源码重建"; fail=1
+            fi
+          done < missing.txt
+
+          echo "保活 $kept / 同步 GHCR $mirrored / 自动恢复 $restored / 失败 $fail"
+          echo "kept=$kept" >> "$GITHUB_OUTPUT"
+          echo "mirrored=$mirrored" >> "$GITHUB_OUTPUT"
+          echo "restored=$restored" >> "$GITHUB_OUTPUT"
+          [ "$fail" = 0 ]
+
+      - name: Keep this schedule enabled
+        if: github.event_name != 'push'
+        run: |
+          set -e
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # 空提交让仓库保持活动，避免 60 天后 scheduled workflow 被 GitHub 自动禁用；
+          # [skip ci] 防止触发 DC 镜像重建。
+          git commit --allow-empty -m 'chore: monthly keepalive [skip ci]' || true
+          git push origin "HEAD:${{ github.ref_name }}" || true
