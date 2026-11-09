@@ -15,11 +15,14 @@ package hubcfg
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -291,27 +294,39 @@ func reachable(target string) (bool, string) {
 	return true, ""
 }
 
-// ---- 检测结论 -> 更新动作的 digest 桥接 ----
+// ---------------------------------------------------------------------------
+// 统一远端口径：检测与更新共用「所有站里构建时间最新的那一份 manifest」
 //
-// 「更新成功却仍提示有更新」的根因：检测阶段按 A digest 判定并亮角标，
-// 点更新时加速站缓存可能已刷新成 B digest，更新按 B 拉取，容器镜像没换成
-// A；检测结果按镜像 ID 索引，ID 没变，角标自然继续亮。这里把检测确认的
-// digest 记下来，更新时优先按它拉取，保证「检测报哪一版就装哪一版」。
-// 记忆带 TTL（略长于 30 分钟检测周期），过期自动失效，不会长期误导。
+// 为什么必须统一：两个加速站的 tag->digest 缓存彼此独立，可能相差十几天。
+// 检测只问「第一个可达站」会随主备切换在新旧 digest 之间摆动；更新又各自
+// 重新取一次 tag digest，两边结论不一致，于是「更新完又提示有更新」死循环。
+//
+// ResolveLatest 一次遍历所有可用站点，按 manifest 对应的镜像构建时间取最新
+// 那份作为唯一权威结论。检测拿它比本地 RepoDigests，更新拿它按 digest 拉取，
+// 两边看到的是同一份数据。按构建时间取最新是单调的：旧站缓存永远不会赢，
+// 不会因为某次探测顺序不同而翻烧饼。全程不写死任何域名。
+// ---------------------------------------------------------------------------
 
-type remoteDigestRecord struct {
-	digest string
-	at     time.Time
+// RemoteVerdict 是某个 repo:tag 在所有可用站点里构建时间最新的 manifest。
+type RemoteVerdict struct {
+	Repo       string
+	Tag        string
+	Host       string // 不含 scheme 的 host[:port]
+	Digest     string
+	Created    time.Time
+	HasCreated bool
+	PullRefs   []string // 按构建时间新->旧排序的 <host>/<repo>@<digest>
 }
 
-var remoteDigestMu sync.RWMutex
-var remoteDigestMemo = map[string]remoteDigestRecord{}
+const remoteAccept = "application/vnd.oci.image.index.v1+json, " +
+	"application/vnd.docker.distribution.manifest.list.v2+json, " +
+	"application/vnd.docker.distribution.manifest.v2+json, " +
+	"application/vnd.oci.image.manifest.v1+json"
 
-// NormalizeDigestKey 把任意镜像引用规范化成 "repo:tag" 作为桥接 key：
-// 去掉 scheme、digest、以及显式 registry host（含端口），让检测侧的
-// lswl/vertex:stable 与更新侧的 qqaazz.xxx/lswl/vertex:stable 落在同一 key。
-func NormalizeDigestKey(imageRef string) string {
-	s := imageRef
+// splitRemoteRef 解析镜像引用，返回 (显式 host, 不带 host 的 repo, tag)。
+// host 为空表示 Docker Hub 官方镜像（走 hubURL 加速站）。
+func splitRemoteRef(imageRef string) (string, string, string, bool) {
+	s := strings.TrimSpace(imageRef)
 	if a, ok := strings.CutPrefix(s, "https://"); ok {
 		s = a
 	} else if a, ok := strings.CutPrefix(s, "http://"); ok {
@@ -320,42 +335,310 @@ func NormalizeDigestKey(imageRef string) string {
 	if i := strings.Index(s, "@"); i >= 0 {
 		s = s[:i]
 	}
-	if i := strings.Index(s, "/"); i >= 0 {
-		first := s[:i]
-		if strings.ContainsAny(first, ".:") || first == "localhost" {
-			s = s[i+1:]
+	// 必须先剥掉 tag 再判断第一段是不是 registry host，否则
+	// "nginx:latest" 里的冒号会被当成「host 带端口」，误判成显式 registry。
+	namePart, tag := s, "latest"
+	if k := strings.LastIndex(namePart, ":"); k > strings.LastIndex(namePart, "/") {
+		tag, namePart = namePart[k+1:], namePart[:k]
+	}
+	first := namePart
+	if i := strings.Index(first, "/"); i >= 0 {
+		first = first[:i]
+	}
+	host, repo := "", namePart
+	if strings.ContainsAny(first, ".:") || first == "localhost" {
+		host = first
+		repo = namePart[len(first)+1:]
+	} else if !strings.Contains(namePart, "/") {
+		repo = "library/" + namePart
+	}
+	if repo == "" || tag == "" {
+		return "", "", "", false
+	}
+	return host, repo, tag, true
+}
+
+// remoteHTTP 对自建加速站放宽证书校验（内网常见自签），公共 registry 保持校验。
+func remoteHTTP(base string) *http.Client {
+	for _, t := range Targets() {
+		if strings.TrimSuffix(t, "/") == base {
+			return &http.Client{Timeout: 8 * time.Second, Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			}}
 		}
 	}
-	if !strings.Contains(s, ":") {
-		s += ":latest"
+	return &http.Client{Timeout: 8 * time.Second}
+}
+
+func remoteJSON(client *http.Client, u, token string) (map[string]interface{}, bool) {
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return nil, false
 	}
-	return s
-}
-
-// RememberRemoteDigest 记录检测阶段确认「有更新」的远端 digest。
-func RememberRemoteDigest(imageRef, digest string) {
-	if digest == "" {
-		return
+	req.Header.Set("Accept", remoteAccept)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	remoteDigestMu.Lock()
-	defer remoteDigestMu.Unlock()
-	remoteDigestMemo[NormalizeDigestKey(imageRef)] = remoteDigestRecord{digest: digest, at: time.Now()}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, false
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, false
+	}
+	body, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
+	if err != nil {
+		return nil, false
+	}
+	var m map[string]interface{}
+	if json.Unmarshal(body, &m) != nil {
+		return nil, false
+	}
+	return m, true
 }
 
-// ForgetRemoteDigest 清除某个镜像的检测 digest 记忆。
-func ForgetRemoteDigest(imageRef string) {
-	remoteDigestMu.Lock()
-	defer remoteDigestMu.Unlock()
-	delete(remoteDigestMemo, NormalizeDigestKey(imageRef))
-}
-
-// KnownRemoteDigest 返回最近一次检测确认的远端 digest；超过 35 分钟视为过期。
-func KnownRemoteDigest(imageRef string) string {
-	remoteDigestMu.RLock()
-	defer remoteDigestMu.RUnlock()
-	v, ok := remoteDigestMemo[NormalizeDigestKey(imageRef)]
-	if !ok || time.Since(v.at) > 35*time.Minute {
+// remoteToken 换取匿名 pull token；站点 /v2/ 直接 200 时返回空串。
+func remoteToken(base, repo string) string {
+	client := remoteHTTP(base)
+	req, err := http.NewRequest(http.MethodGet, base+"/v2/", nil)
+	if err != nil {
 		return ""
 	}
-	return v.digest
+	res, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	res.Body.Close()
+	if res.StatusCode == http.StatusOK {
+		return ""
+	}
+	realm, service := remoteBearer(res.Header.Get("WWW-Authenticate"))
+	if realm == "" {
+		return ""
+	}
+	u := realm + "?service=" + url.QueryEscape(service) + "&scope=" + url.QueryEscape("repository:"+repo+":pull")
+	req2, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return ""
+	}
+	res2, err := client.Do(req2)
+	if err != nil {
+		return ""
+	}
+	defer res2.Body.Close()
+	if res2.StatusCode != http.StatusOK {
+		return ""
+	}
+	body, _ := io.ReadAll(io.LimitReader(res2.Body, 1<<20))
+	var m map[string]interface{}
+	if json.Unmarshal(body, &m) != nil {
+		return ""
+	}
+	if tok, _ := m["token"].(string); tok != "" {
+		return tok
+	}
+	tok, _ := m["access_token"].(string)
+	return tok
+}
+
+func remoteBearer(ch string) (string, string) {
+	ch = strings.TrimSpace(ch)
+	if len(ch) < 7 || !strings.EqualFold(ch[:7], "bearer ") {
+		return "", ""
+	}
+	realm, service := "", ""
+	for _, p := range strings.Split(ch[7:], ",") {
+		kv := strings.SplitN(strings.TrimSpace(p), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		v := strings.Trim(kv[1], `"`)
+		switch strings.ToLower(kv[0]) {
+		case "realm":
+			realm = v
+		case "service":
+			service = v
+		}
+	}
+	return realm, service
+}
+
+// remoteManifestDigest 用 GET 取 tag 当前指向的 manifest digest（index 优先）。
+func remoteManifestDigest(base, repo, tag, token string) string {
+	client := remoteHTTP(base)
+	req, err := http.NewRequest(http.MethodGet, base+"/v2/"+repo+"/manifests/"+tag, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Accept", remoteAccept)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return ""
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 1<<20))
+	return strings.TrimSpace(res.Header.Get("Docker-Content-Digest"))
+}
+
+// remoteManifestCreated 沿 index -> 子 manifest -> config blob 取构建时间。
+func remoteManifestCreated(base, repo, digest, token string) (time.Time, bool) {
+	client := remoteHTTP(base)
+	top, ok := remoteJSON(client, base+"/v2/"+repo+"/manifests/"+digest, token)
+	if !ok {
+		return time.Time{}, false
+	}
+	cfg := ""
+	if list, isList := top["manifests"].([]interface{}); isList && len(list) > 0 {
+		for _, item := range list {
+			m, _ := item.(map[string]interface{})
+			plat, _ := m["platform"].(map[string]interface{})
+			arch, _ := plat["architecture"].(string)
+			osName, _ := plat["os"].(string)
+			d, _ := m["digest"].(string)
+			if d != "" && arch == runtime.GOARCH && (osName == "" || osName == runtime.GOOS) {
+				cfg = d
+				break
+			}
+		}
+		if cfg == "" {
+			if first, ok := list[0].(map[string]interface{}); ok {
+				cfg, _ = first["digest"].(string)
+			}
+		}
+		if cfg == "" {
+			return time.Time{}, false
+		}
+		child, ok := remoteJSON(client, base+"/v2/"+repo+"/manifests/"+cfg, token)
+		if !ok {
+			return time.Time{}, false
+		}
+		c, _ := child["config"].(map[string]interface{})
+		cfg, _ = c["digest"].(string)
+	} else {
+		c, _ := top["config"].(map[string]interface{})
+		cfg, _ = c["digest"].(string)
+	}
+	if cfg == "" {
+		return time.Time{}, false
+	}
+	blob, ok := remoteJSON(client, base+"/v2/"+repo+"/blobs/"+cfg, token)
+	if !ok {
+		return time.Time{}, false
+	}
+	s, _ := blob["created"].(string)
+	if s == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// ResolveLatest 遍历所有可用站点，返回构建时间最新的 manifest 及其拉取候选。
+// 检测与更新必须都调用本函数，才会看到同一份结论。
+func ResolveLatest(imageRef string) (RemoteVerdict, bool) {
+	host, repo, tag, ok := splitRemoteRef(imageRef)
+	if !ok {
+		return RemoteVerdict{}, false
+	}
+	var targets []string
+	if host != "" {
+		isHub := false
+		for _, t := range Targets() {
+			u, _ := url.Parse(t)
+			if strings.EqualFold(u.Host, host) {
+				isHub = true
+				break
+			}
+		}
+		if isHub {
+			targets = Targets()
+		} else {
+			targets = []string{"https://" + host}
+		}
+	} else {
+		targets = Targets()
+		if len(targets) == 0 {
+			// 未配置加速站时退化为直连 Docker Hub，行为与原版一致。
+			targets = []string{"https://registry-1.docker.io"}
+		}
+	}
+
+	type cand struct {
+		host, digest string
+		created      time.Time
+		has          bool
+		order        int
+	}
+	ch := make(chan cand, len(targets))
+	for idx, t := range targets {
+		go func(idx int, t string) {
+			base := strings.TrimSuffix(t, "/")
+			u, _ := url.Parse(base)
+			tok := remoteToken(base, repo)
+			dg := remoteManifestDigest(base, repo, tag, tok)
+			if dg == "" {
+				ch <- cand{order: idx}
+				return
+			}
+			cr, has := remoteManifestCreated(base, repo, dg, tok)
+			ch <- cand{host: u.Host, digest: dg, created: cr, has: has, order: idx}
+		}(idx, t)
+	}
+	cands := make([]cand, 0, len(targets))
+	timeout := time.After(12 * time.Second)
+loop:
+	for i := 0; i < len(targets); i++ {
+		select {
+		case c := <-ch:
+			if c.digest != "" {
+				cands = append(cands, c)
+			}
+		case <-timeout:
+			break loop
+		}
+	}
+	if len(cands) == 0 {
+		return RemoteVerdict{}, false
+	}
+	sort.SliceStable(cands, func(a, b int) bool {
+		if cands[a].has != cands[b].has {
+			return cands[a].has
+		}
+		if cands[a].has && !cands[a].created.Equal(cands[b].created) {
+			return cands[a].created.After(cands[b].created)
+		}
+		return cands[a].order < cands[b].order
+	})
+	best := cands[0]
+	v := RemoteVerdict{
+		Repo: repo, Tag: tag, Host: best.host, Digest: best.digest,
+		Created: best.created, HasCreated: best.has,
+	}
+	seen := map[string]bool{}
+	add := func(ref string) {
+		if !seen[ref] {
+			seen[ref] = true
+			v.PullRefs = append(v.PullRefs, ref)
+		}
+	}
+	for _, c := range cands {
+		add(c.host + "/" + repo + "@" + c.digest)
+	}
+	// 最新那份 digest 在所有可达站上都试一遍：某站可能还没回源该 blob。
+	for _, c := range cands {
+		add(c.host + "/" + repo + "@" + best.digest)
+	}
+	logx.Infof("远端最新 manifest [%s:%s] digest=%s host=%s created=%s 候选=%d",
+		repo, tag, v.Digest, v.Host, v.Created.Format(time.RFC3339), len(v.PullRefs))
+	return v, true
 }

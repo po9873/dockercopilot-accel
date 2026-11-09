@@ -48,6 +48,46 @@ STATE_FILE = Path("upstream/internal/module/hubrecheck.go")
 
 # 在比对出 needUpdate 之后、写入 status 之前插入复查确认。
 # 只锚定这一行，避免上游比对循环重构后补丁失配。
+# 统一远端口径：检测与更新共用 hubcfg.ResolveLatest 的实时结论。
+# 命中即返回，后面的单站 HEAD / 复查 / STALE / digestCache 全部退化为
+#「所有站点都不可达」时的兜底；任何单站旧缓存都不会成为结论。
+ANCHOR_EARLY = "\timageRef := image.ImageName + \":\" + image.ImageTag\n"
+REPL_EARLY = """\timageRef := image.ImageName + ":" + image.ImageTag
+\tif image.ImageName != "None" && image.ImageTag != "None" {
+\t\tif verdict, ok := hubcfg.ResolveLatest(imageRef); ok {
+\t\t\tneedUpdate := true
+\t\t\tfor _, rd := range image.RepoDigests {
+\t\t\t\tparts := strings.SplitN(rd, "@", 2)
+\t\t\t\tif len(parts) == 2 && parts[1] == verdict.Digest {
+\t\t\t\t\tneedUpdate = false
+\t\t\t\t\tbreak
+\t\t\t\t}
+\t\t\t}
+\t\t\tif len(image.RepoDigests) == 0 {
+\t\t\t\tif verdict.HasCreated && image.Created > 0 {
+\t\t\t\t\tneedUpdate = verdict.Created.Unix() > image.Created
+\t\t\t\t} else {
+\t\t\t\t\ti.setResult(image.ID, ImageCheckList{NeedUpdate: false, Status: StatusUnknown, Reason: "本地无 repoDigest 且远端构建时间不可得"})
+\t\t\t\t\treturn
+\t\t\t\t}
+\t\t\t}
+\t\t\t// 所有站点都停在旧缓存（远端构建时间不晚于本地）时不报更新。
+\t\t\tif needUpdate && verdict.HasCreated && image.Created > 0 && verdict.Created.Unix() <= image.Created {
+\t\t\t\tneedUpdate = false
+\t\t\t}
+\t\t\tstatus := StatusLatest
+\t\t\tif needUpdate {
+\t\t\t\tstatus = StatusNeedUpdate
+\t\t\t\tlogx.Infof("镜像有更新 [%s] digest=%s localRepoDigests=%v", imageRef, verdict.Digest, image.RepoDigests)
+\t\t\t} else {
+\t\t\t\tlogx.Debugf("镜像已是最新 [%s] digest=%s", imageRef, verdict.Digest)
+\t\t\t}
+\t\t\ti.setResult(image.ID, ImageCheckList{NeedUpdate: needUpdate, Status: status})
+\t\t\treturn
+\t\t}
+\t}
+"""
+
 ANCHOR = "\tstatus := StatusLatest\n"
 
 # 上游原生分支：本地无 RepoDigests 直接判「无法比对」。
@@ -73,11 +113,6 @@ REPLACEMENT_NODIGEST = """\tif len(image.RepoDigests) == 0 {
 \t\t\t\tstatus = StatusNeedUpdate
 \t\t\t} else {
 \t\t\t\tlogx.Debugf("镜像已是最新（按构建时间比对，本地无 repoDigest）[%s]", imageRef)
-\t\t\t}
-\t\t\tif newer && remoteDigest != "" {
-\t\t\t\thubcfg.RememberRemoteDigest(imageRef, remoteDigest)
-\t\t\t} else {
-\t\t\t\thubcfg.ForgetRemoteDigest(imageRef)
 \t\t\t}
 \t\t\ti.setResult(image.ID, ImageCheckList{NeedUpdate: newer, Status: status})
 \t\t\treturn
@@ -129,14 +164,6 @@ REPLACEMENT = """	// 远端与本地不一致时，先强制刷新自建加速�
             logx.Infof("加速站疑似更新已排除 [%s] %s", imageRef, why)
         }
     }
-	// 把本轮确认的远端 digest 交给更新流程：点「更新」必须拉检测报出来的
-	// 这一版，否则加速站缓存刷新前后两处取到的 digest 不同，就会
-	// 「更新成功却仍提示有更新」。判为已是最新时清掉记忆，避免误导。
-	if needUpdate && remoteDigest != "" {
-		hubcfg.RememberRemoteDigest(imageRef, remoteDigest)
-	} else {
-		hubcfg.ForgetRemoteDigest(imageRef)
-	}
 	status := StatusLatest
 """
 
@@ -457,6 +484,14 @@ def main() -> int:
         )
         return 1
     text = text.replace(ANCHOR_NODIGEST, REPLACEMENT_NODIGEST)
+
+    # 统一远端口径：命中即返回，绕开所有单站缓存/复查逻辑
+    earlyCount = text.count(ANCHOR_EARLY)
+    if earlyCount != 1:
+        print(f"[patch_cachelag] 统一结论锚点匹配到 {earlyCount} 次（期望 1 次）", file=sys.stderr)
+        return 1
+    text = text.replace(ANCHOR_EARLY, REPL_EARLY)
+
 
     CHECKUPDATE.write_text(text, encoding="utf-8", newline="\n")
     STATE_FILE.write_text(RECHECK_GO, encoding="utf-8", newline="\n")
