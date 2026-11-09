@@ -20,6 +20,12 @@
   3. 拉取前调用自建加速站管理口 /api/cache/cleanup?force=1 强制刷新
      manifest 缓存（KSpeeder TTL 不可调，普通 cleanup 只清过期条目），
      避免拉到缓存里的旧 digest。失败只记日志、不阻断；hubCachePurge=off 可关。
+  4. 拉取后清理「旧版残留镜像」：删掉不再被任何容器引用、且仍挂着加速站
+     前缀 tag 的整张镜像。CleanOtherHubAliases 只管本次拉取的那张，换源
+     （qqaazz <-> ghcr）后上一版镜像上的旧 tag 永远没人清，几百 MB 且界面
+     删不掉。同时在删除接口加安全兜底：镜像挂多个仓库名被 dockerd 以
+     "referenced in multiple repositories" 拒绝时，确认无容器引用后自动
+     用 force 重试一次——修掉「界面点删除没反应」，仍在用的镜像保持失败。
 
 不引入代理、不引入第三方镜像站、不改任何宿主机 Docker 配置。
 锚点未命中（上游重构）时以非零码退出，让构建失败并通知维护者。
@@ -31,6 +37,7 @@ from pathlib import Path
 UPDATE = Path("upstream/internal/utiles/updatecontainer.go")
 SELF = Path("upstream/internal/utiles/selfupdate.go")
 HELPER = Path("upstream/internal/utiles/hubpull.go")
+REMOVE = Path("upstream/internal/utiles/removeimage.go")
 
 ANCHOR_UPDATE = """	cli.NegotiateAPIVersion(ctx)
 	// 携带凭据拉取私有镜像；registryAuth 为空时等价于匿名拉取
@@ -69,6 +76,11 @@ REPL_DECODE = """	err = decodePullResp(ctx, reader, serviceContext, taskID)
 		// 检测落回「未知/误报」。详见 hubpull.go 的 CleanOtherHubAliases。
 		CleanOtherHubAliases(ctx, cli, pullRef)
 		logx.Infof("加速站引用已保留（携带 RepoDigests，保证检测可用）: %s", pullRef)
+		// 换源之后，上一版镜像上的旧加速站 tag 不会自动转移，会永久占着
+		// 几百 MB 且界面上删不掉。这里顺手清掉，刚拉的这张用 keepID 保护。
+		if ins, ierr := cli.ImageInspect(ctx, imageNameAndTag); ierr == nil {
+			PurgeStaleHubImages(ctx, cli, ins.ID)
+		}
 	}
 	if err != nil {
 		markTaskFailed(serviceContext, taskID, &oldTaskProgress, "拉取镜像失败", err)
@@ -107,6 +119,11 @@ REPL_SELF = """func pullImageForSelfUpdate(ctx context.Context, svcCtx *svc.Serv
 		// 保证检测可用），只清理其它加速站同名别名，避免主备切换累积别名。
 		CleanOtherHubAliases(ctx, svcCtx.DockerClient, pullRef)
 		logx.Infof("自更新：加速站引用已保留（携带 RepoDigests）: %s", pullRef)
+		// 同 UpdateContainerOnHost：清掉旧版镜像上的历史加速站引用。
+		// 自更新时新镜像尚未被容器引用，必须用 keepID 显式保护。
+		if ins, ierr := svcCtx.DockerClient.ImageInspect(ctx, imageNameAndTag); ierr == nil {
+			PurgeStaleHubImages(ctx, svcCtx.DockerClient, ins.ID)
+		}
 	}
 	return nil
 }
@@ -122,6 +139,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/l429609201/dockerCopilot/internal/hubcfg"
@@ -260,7 +278,163 @@ func PurgeHubCache(ctx context.Context) {
 	defer res.Body.Close()
 	logx.Infof("自建加速站缓存已强制刷新: %s status=%d", target, res.StatusCode)
 }
+
+// PurgeStaleHubImages 删掉「旧版本残留镜像」：不再被任何容器引用、且仍挂着
+// 加速站前缀 tag 的整张镜像。
+//
+// 为什么需要：CleanOtherHubAliases 只处理「本次拉取的那张镜像」。每次换源
+// （qqaazz <-> ghcr）之后，上一版镜像上那个 <旧站>/<repo>:<tag> 就永远没人
+// 清。Docker 的 image prune 只清 <none>:<none>，这类镜像挂着完整 tag 不算
+// dangling；界面点删除又会被 dockerd 以 "image is referenced in multiple
+// repositories" 拒绝（一张镜像同时挂 <站>/<repo>:<tag> 和 ghcr.io 的 <none>）。
+// 结果就是一堆几百 MB 的「未使用」镜像躺在列表里删不掉。
+//
+// 安全性：keepID 是刚拉取的新镜像，无论有没有容器引用都不删；其余只删
+// 「无任何容器（含已停止）引用」的，正在用的版本永远不碰。
+func PurgeStaleHubImages(ctx context.Context, cli *client.Client, keepID string) {
+	hosts := make([]string, 0, 4)
+	for _, t := range hubcfg.Targets() {
+		h := t
+		if s, ok := strings.CutPrefix(t, "https://"); ok {
+			h = s
+		} else if s, ok := strings.CutPrefix(t, "http://"); ok {
+			h = s
+		}
+		if h != "" {
+			hosts = append(hosts, h+"/")
+		}
+	}
+	if len(hosts) == 0 {
+		return
+	}
+	keep := strings.TrimPrefix(keepID, "sha256:")
+
+	// 收集在用镜像 ID（含已停止容器）；列举失败就整体跳过，不做模糊判断。
+	inUse := map[string]bool{}
+	ctns, cerr := cli.ContainerList(ctx, container.ListOptions{All: true})
+	if cerr != nil {
+		logx.Infof("warn: 列举容器失败，跳过旧版镜像清理: %v", cerr)
+		return
+	}
+	for _, c := range ctns {
+		inUse[strings.TrimPrefix(c.ImageID, "sha256:")] = true
+	}
+
+	imgs, ierr := cli.ImageList(ctx, image.ListOptions{All: true})
+	if ierr != nil {
+		logx.Infof("warn: 列举镜像失败，跳过旧版镜像清理: %v", ierr)
+		return
+	}
+	cleaned := 0
+	for _, im := range imgs {
+		id := strings.TrimPrefix(im.ID, "sha256:")
+		short := id
+		if len(short) > 12 {
+			short = short[:12]
+		}
+		if id == keep || inUse[id] {
+			continue
+		}
+		// RepoTags 只覆盖「仍带 tag」的引用；那些已经变成 <none> 的，只能从
+		// RepoDigests 看出它来自哪个加速站（形如 <站>/<repo>@sha256:...）。
+		// 两类都要看，否则 <站>/<repo>:<none> 这种会漏清。
+		refs := make([]string, 0, len(im.RepoTags)+len(im.RepoDigests))
+		refs = append(refs, im.RepoTags...)
+		refs = append(refs, im.RepoDigests...)
+		hit := ""
+		for _, t := range refs {
+			for _, h := range hosts {
+				if strings.HasPrefix(t, h) {
+					hit = t
+					break
+				}
+			}
+			if hit != "" {
+				break
+			}
+		}
+		if hit == "" {
+			continue
+		}
+		if _, rerr := cli.ImageRemove(ctx, im.ID, image.RemoveOptions{Force: true, PruneChildren: true}); rerr != nil {
+			logx.Infof("warn: 清理旧版加速站镜像 %s 失败（忽略）: %v", short, rerr)
+			continue
+		}
+		cleaned++
+		logx.Infof("已清理旧版加速站镜像: %s [%s]", short, hit)
+	}
+	if cleaned > 0 {
+		logx.Infof("旧版加速站镜像清理完成，共 %d 个", cleaned)
+	}
+}
 '''
+
+ANCHOR_REMOVE_IMPORT = """import (
+	"context"
+	"fmt"
+
+	"github.com/docker/docker/api/types/image"
+	"github.com/l429609201/dockerCopilot/internal/svc"
+)"""
+
+REPL_REMOVE_IMPORT = """import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/client"
+	"github.com/l429609201/dockerCopilot/internal/svc"
+	"github.com/zeromicro/go-zero/core/logx"
+)"""
+
+ANCHOR_REMOVE_BODY = """	_, err := cli.ImageRemove(context.Background(), imageID, image.RemoveOptions{Force: force})
+	if err != nil {
+		return err
+	}
+	return nil
+}"""
+
+REPL_REMOVE_BODY = """	rmCtx := context.Background()
+	_, err := cli.ImageRemove(rmCtx, imageID, image.RemoveOptions{Force: force})
+	if err == nil || force {
+		return err
+	}
+	// 界面删除默认 force=false（RemoveImageReq.Force 的默认值是 false）。
+	// 镜像同时挂多个仓库名时（<加速站>/<repo>:<tag> + <repo>:<tag> + ghcr.io 的
+	// <none>），dockerd 直接回 "image is referenced in multiple repositories"，
+	// 界面上表现为「点了删除没反应」。这类残留通常已无容器引用：确认没有容器
+	// 在用后自动用 force 重试一次；仍在被容器引用的镜像保持原错误，绝不强删。
+	if imageInUseByContainer(cli, imageID) {
+		return err
+	}
+	if _, err2 := cli.ImageRemove(rmCtx, imageID, image.RemoveOptions{Force: true, PruneChildren: true}); err2 == nil {
+		logx.Infof("镜像 %s 挂多个仓库名且无容器引用，已强制删除", imageID)
+		return nil
+	}
+	return err
+}
+
+// imageInUseByContainer 判断镜像是否被任何容器（含已停止）引用。
+// 查不到镜像信息或列举容器失败时返回 true（保守处理，绝不放行强删）。
+func imageInUseByContainer(cli *client.Client, imageID string) bool {
+	ins, ierr := cli.ImageInspect(context.Background(), imageID)
+	if ierr != nil {
+		return true
+	}
+	full := strings.TrimPrefix(ins.ID, "sha256:")
+	list, lerr := cli.ContainerList(context.Background(), container.ListOptions{All: true})
+	if lerr != nil {
+		return true
+	}
+	for _, c := range list {
+		if strings.TrimPrefix(c.ImageID, "sha256:") == full {
+			return true
+		}
+	}
+	return false
+}"""
 
 
 def apply(path: Path, anchor: str, replacement: str, name: str) -> int:
@@ -285,6 +459,8 @@ def main() -> int:
     rc |= apply(UPDATE, ANCHOR_UPDATE, REPL_UPDATE, "updatecontainer/pull")
     rc |= apply(UPDATE, ANCHOR_DECODE, REPL_DECODE, "updatecontainer/tag")
     rc |= apply(SELF, ANCHOR_SELF, REPL_SELF, "selfupdate/pull")
+    rc |= apply(REMOVE, ANCHOR_REMOVE_IMPORT, REPL_REMOVE_IMPORT, "removeimage/import")
+    rc |= apply(REMOVE, ANCHOR_REMOVE_BODY, REPL_REMOVE_BODY, "removeimage/force-fallback")
     if rc:
         return rc
     if not HELPER.parent.is_dir():
