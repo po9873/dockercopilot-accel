@@ -30,6 +30,12 @@ hubCacheRecheck=off 可关闭复查（退回原判定）。
 下一轮自动改用 hubURL 里的下一站，冷却到期后该站重新参与探测。
 远端确实更新（构建时间更晚）时保持原判定，真更新不会被吞掉。
 hubStaleCheck=off 可单独关闭。
+
+此外引入「权威判定（A）」：镜像站只作数据来源、不再单独裁决「有没有更新」。
+所有可达镜像站对 tag 的 digest 达成一致时，视为 Docker Hub 当前权威状态，仅凭 digest
+不一致即可判定真更新（无需远端构建时间佐证）；一旦镜像站之间 digest 不一致（缓存漂移），
+则必须能证实远端构建时间确实比本地新才报更新，否则判 Unknown 不报，从根上消除
+「我没发新版却提示有更新」的误报。hubcfg.ResolveLatest 返回 Consensus 字段供检测使用。
 锚点未命中（上游重构）时以非零码退出，让构建失败并通知维护者。
 
 此外根治「空 RepoDigests 漏报」：三台宿主均无法直连 docker.io(registry-1.docker.io
@@ -71,14 +77,33 @@ REPL_EARLY = """\timageRef := image.ImageName + ":" + image.ImageTag
 \t\t\t\t\treturn
 \t\t\t\t}
 \t\t\t}
-\t\t\t// 所有站点都停在旧缓存（远端构建时间不晚于本地）时不报更新。
-\t\t\tif needUpdate && verdict.HasCreated && image.Created > 0 && verdict.Created.Unix() <= image.Created {
-\t\t\t\tneedUpdate = false
+\t\t\t// 权威判定（A）：镜像站只作数据来源，不再单独裁决"有没有更新"。
+\t\t\t// 所有可达镜像站 digest 一致 -> 视为 Docker Hub 当前权威状态，
+\t\t\t//   仅凭 digest 不一致即判真更新（无需构建时间佐证）；但若能读到
+\t\t\t//   构建时间且远端不比本地新，仍判为旧缓存（极端：所有站同时陈旧）。
+\t\t\t// 镜像站之间 digest 不一致（缓存漂移）-> 不能仅凭某站说"不同"就判更新，
+\t\t\t//   必须能证实远端构建时间确实比本地新才报；否则判 Unknown 不报，
+\t\t\t//   彻底杜绝"我没发新版却提示有更新"的误报。
+\t\t\tif needUpdate {
+\t\t\t\tif verdict.Consensus {
+\t\t\t\t\tif verdict.HasCreated && image.Created > 0 && verdict.Created.Unix() <= image.Created {
+\t\t\t\t\t\tneedUpdate = false
+\t\t\t\t\t}
+\t\t\t\t} else if verdict.HasCreated && image.Created > 0 {
+\t\t\t\t\tif verdict.Created.Unix() > image.Created {
+\t\t\t\t\t\tneedUpdate = true
+\t\t\t\t\t} else {
+\t\t\t\t\t\tneedUpdate = false
+\t\t\t\t\t}
+\t\t\t\t} else {
+\t\t\t\t\ti.setResult(image.ID, ImageCheckList{NeedUpdate: false, Status: StatusUnknown, Reason: "镜像站 digest 不一致且远端构建时间不可验证，暂缓判定"})
+\t\t\t\t\treturn
+\t\t\t\t}
 \t\t\t}
 \t\t\tstatus := StatusLatest
 \t\t\tif needUpdate {
 \t\t\t\tstatus = StatusNeedUpdate
-\t\t\t\tlogx.Infof("镜像有更新 [%s] digest=%s localRepoDigests=%v", imageRef, verdict.Digest, image.RepoDigests)
+\t\t\t\tlogx.Infof("镜像有更新 [%s] digest=%s localRepoDigests=%v consensus=%v", imageRef, verdict.Digest, image.RepoDigests, verdict.Consensus)
 \t\t\t} else {
 \t\t\t\tlogx.Debugf("镜像已是最新 [%s] digest=%s", imageRef, verdict.Digest)
 \t\t\t}

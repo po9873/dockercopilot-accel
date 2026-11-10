@@ -315,6 +315,7 @@ type RemoteVerdict struct {
 	Digest     string
 	Created    time.Time
 	HasCreated bool
+	Consensus  bool     // 所有可达镜像站 digest 一致，视为 Docker Hub 当前权威状态
 	PullRefs   []string // 按构建时间新->旧排序的 <host>/<repo>@<digest>
 }
 
@@ -620,9 +621,26 @@ loop:
 		return cands[a].order < cands[b].order
 	})
 	best := cands[0]
+	// 权威判定（A）：所有可达镜像站返回的 digest 是否完全一致。
+	// 一致 -> 视为 Docker Hub 当前权威状态，检测可仅凭 digest 不一致判定（无需构建时间佐证）；
+	// 不一致（镜像站缓存漂移）-> 不能仅凭某站说"不同"就判更新，需要远端构建时间佐证，
+	// 否则判 Unknown 不报，彻底杜绝"我没发新版却提示有更新"的误报。
+	// 某站超时/不可达导致 cands 少于 targets 时也视为不一致，保守处理。
+	consensus := false
+	if len(cands) == len(targets) && len(cands) > 0 {
+		d0 := cands[0].digest
+		allSame := true
+		for _, c := range cands {
+			if c.digest != d0 {
+				allSame = false
+				break
+			}
+		}
+		consensus = allSame
+	}
 	v := RemoteVerdict{
 		Repo: repo, Tag: tag, Host: best.host, Digest: best.digest,
-		Created: best.created, HasCreated: best.has,
+		Created: best.created, HasCreated: best.has, Consensus: consensus,
 	}
 	seen := map[string]bool{}
 	add := func(ref string) {
@@ -638,7 +656,7 @@ loop:
 	for _, c := range cands {
 		add(c.host + "/" + repo + "@" + best.digest)
 	}
-	logx.Infof("远端最新 manifest [%s:%s] digest=%s host=%s created=%s 候选=%d",
-		repo, tag, v.Digest, v.Host, v.Created.Format(time.RFC3339), len(v.PullRefs))
+	logx.Infof("远端最新 manifest [%s:%s] digest=%s host=%s created=%s 候选=%d consensus=%v",
+		repo, tag, v.Digest, v.Host, v.Created.Format(time.RFC3339), len(v.PullRefs), v.Consensus)
 	return v, true
 }
