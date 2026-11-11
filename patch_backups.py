@@ -8,8 +8,8 @@
         上游把 Web 备份页改成只渲染 <DataBackups />（新数据归档），旧配置快照
         (backup-*.json/.yaml) 虽仍在 /data/backups 且后端 /container/listBackups、
         /container/backups(delete) 接口都保留，却不再出现在 Web 上。
-        本补丁把 Backups 组件改回「容器配置快照区块(显示/下载/删除) + <DataBackups/>」，
-        让两类备份都在 Web 备份页可见、可管理。
+        本补丁把 Backups 组件改回「容器配置快照区块(显示/下载/删除/全选批量删除)
+        + <DataBackups/>」，让两类备份都在 Web 备份页可见、可管理。
   - frontend-react/src/api/client.js
         补 containerAPI.downloadBackup(filename)，下载旧配置快照（blob）。
   - internal/handler/container/delrestorehandler.go
@@ -33,7 +33,7 @@ ROOT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "upstream")
 # (相对路径, 原字符串, 新字符串, 期望出现次数)
 PATCHES = [
 
-    # 1) Backups.jsx：旧快照区块 + 保留 DataBackups
+    # 1) Backups.jsx：旧快照区块（全选+批量删除）+ 保留 DataBackups
     (
         "frontend-react/src/components/Backups.jsx",
         "import React from 'react'\n"
@@ -57,6 +57,8 @@ PATCHES = [
         "  const [dlId, setDlId] = useState('')\n"
         "  const [delTarget, setDelTarget] = useState(null)\n"
         "  const [deleting, setDeleting] = useState(false)\n"
+        "  const [selected, setSelected] = useState([])\n"
+        "  const [batchDeleting, setBatchDeleting] = useState(false)\n"
         "\n"
         "  const loadSnapshots = useCallback(async () => {\n"
         "    setLoading(true)\n"
@@ -99,19 +101,50 @@ PATCHES = [
         "    finally { setDeleting(false) }\n"
         "  }\n"
         "\n"
+        "  const allChecked = snapshots.length > 0 && selected.length === snapshots.length\n"
+        "  const toggleAll = () => setSelected(allChecked ? [] : snapshots.slice())\n"
+        "  const toggleOne = (name) => setSelected((prev) => prev.includes(name) ? prev.filter((x) => x !== name) : [...prev, name])\n"
+        "  const batchRemove = async () => {\n"
+        "    if (!selected.length || batchDeleting) return\n"
+        "    if (!window.confirm(`确定删除选中的 ${selected.length} 个快照？此操作不可恢复。`)) return\n"
+        "    setBatchDeleting(true)\n"
+        "    let failed = 0\n"
+        "    for (const name of selected) {\n"
+        "      try { await containerAPI.deleteBackup(name) }\n"
+        "      catch (e) { failed++; setError(`${name} 删除失败：${e.response?.data?.msg || e.message}`) }\n"
+        "    }\n"
+        "    setBatchDeleting(false)\n"
+        "    setSelected([])\n"
+        "    await loadSnapshots()\n"
+        "  }\n"
+        "\n"
         "  return (\n"
         "    <div className=\"w-full px-2 sm:px-6 py-4 text-gray-900 dark:text-gray-100\">\n"
         "      <header className=\"flex flex-wrap items-center justify-between gap-3 pb-5\">\n"
-        "        <div className=\"flex items-center gap-3\"><FileJson className=\"h-6 w-6 text-emerald-600\" /><h2 className=\"text-xl font-semibold\">容器配置快照</h2><span className=\"text-sm text-gray-500\">{snapshots.length} 个 · 旧版定时/指令备份</span></div>\n"
+        "        <div className=\"flex flex-wrap items-center gap-3\">\n"
+        "          <FileJson className=\"h-6 w-6 text-emerald-600\" />\n"
+        "          <h2 className=\"text-xl font-semibold\">容器配置快照</h2>\n"
+        "          <span className=\"text-sm text-gray-500\">{snapshots.length} 个 · 旧版定时/指令备份</span>\n"
+        "          {selected.length > 0 && (\n"
+        "            <button onClick={batchRemove} disabled={batchDeleting} className=\"ml-1 inline-flex items-center gap-2 rounded-lg bg-red-600 text-white px-3 py-1.5 text-sm disabled:opacity-50\">\n"
+        "              {batchDeleting ? <Loader2 className=\"h-4 w-4 animate-spin\" /> : <Trash2 className=\"h-4 w-4\" />}\n"
+        "              删除选中 ({selected.length})\n"
+        "            </button>\n"
+        "          )}\n"
+        "        </div>\n"
         "        <button onClick={loadSnapshots} disabled={loading} title=\"刷新\" aria-label=\"刷新\" className=\"inline-flex h-8 w-8 items-center justify-center rounded-lg text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-40\"><RefreshCw className={`${'h-4 w-4 '}${loading ? 'animate-spin' : ''}`} /></button>\n"
         "      </header>\n"
         "      {error && <div role=\"alert\" className=\"mb-3 rounded-lg bg-red-50 dark:bg-red-950/30 px-3 py-2 text-sm text-red-600 break-words\">{error}</div>}\n"
         "      <div className=\"overflow-x-auto\">\n"
-        "        <table className=\"w-full min-w-[560px] text-left text-sm\">\n"
-        "          <thead className=\"text-xs text-gray-500 bg-gray-50 dark:bg-gray-800/50\"><tr>{['文件名', '日期', '来源', '操作'].map((l) => <th key={l} className=\"px-3 py-3 font-medium\">{l}</th>)}</tr></thead>\n"
+        "        <table className=\"w-full min-w-[640px] text-left text-sm\">\n"
+        "          <thead className=\"text-xs text-gray-500 bg-gray-50 dark:bg-gray-800/50\"><tr>\n"
+        "            <th className=\"px-3 py-3 w-10\"><input type=\"checkbox\" checked={allChecked} onChange={toggleAll} aria-label=\"全选\" className=\"h-4 w-4 cursor-pointer accent-emerald-600\" /></th>\n"
+        "            {['文件名', '日期', '来源', '操作'].map((l) => <th key={l} className=\"px-3 py-3 font-medium\">{l}</th>)}\n"
+        "          </tr></thead>\n"
         "          <tbody className=\"divide-y divide-gray-200 dark:divide-gray-700\">\n"
         "            {snapshots.map((name) => { const p = parseName(name); return (\n"
         "              <tr key={name} className=\"hover:bg-gray-50 dark:hover:bg-gray-800/40\">\n"
+        "                <td className=\"px-3 py-4 w-10\"><input type=\"checkbox\" checked={selected.includes(name)} onChange={() => toggleOne(name)} aria-label={`选择 ${name}`} className=\"h-4 w-4 cursor-pointer accent-emerald-600\" /></td>\n"
         "                <td className=\"px-3 py-4 font-mono break-all\">{name}</td>\n"
         "                <td className=\"px-3 py-4 whitespace-nowrap\">{p.date}</td>\n"
         "                <td className=\"px-3 py-4 whitespace-nowrap\">{p.host}</td>\n"
