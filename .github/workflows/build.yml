@@ -146,6 +146,17 @@ jobs:
           set -euo pipefail
           python3 patch_attribution.py
 
+      # 3.8 备份页同时展示旧版「容器配置快照」与新版「数据归档」：
+      #     上游把 Web 备份页改成只渲染 DataBackups，旧配置快照(.json/.yaml)
+      #     虽仍在 /data/backups 且后端 /container/listBackups、/container/backups(delete)
+      #     接口都保留，却不再出现在 Web 上。补丁把 Backups.jsx 改回同时渲染
+      #     旧快照区块(显示/下载/删除)与 DataBackups；并补一个
+      #     GET /container/backups/download 下载接口 + client.js 的 downloadBackup。
+      - name: Overlay backups page show legacy snapshots patch
+        run: |
+          set -euo pipefail
+          python3 patch_backups.py
+
       - name: Prepare version info
         run: |
           set -euo pipefail
