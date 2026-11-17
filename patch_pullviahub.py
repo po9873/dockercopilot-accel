@@ -304,7 +304,8 @@ func HubDigestPullRefs(tagPullRef string) []string {
 }
 
 // PurgeStaleHubImages 删掉「旧版本残留镜像」：不再被任何容器引用、且仍挂着
-// 加速站前缀 tag 的整张镜像。
+// 加速站前缀 tag 的整张镜像；以及从 ghcr.io / docker.io 等显式 registry 按
+// digest 拉取后 tag 被新版本转移、只剩 <repo>:<none> 的悬空旧镜像。
 //
 // 为什么需要：CleanOtherHubAliases 只处理「本次拉取的那张镜像」。每次换源
 // （qqaazz <-> ghcr）之后，上一版镜像上那个 <旧站>/<repo>:<tag> 就永远没人
@@ -313,10 +314,18 @@ func HubDigestPullRefs(tagPullRef string) []string {
 // repositories" 拒绝（一张镜像同时挂 <站>/<repo>:<tag> 和 ghcr.io 的 <none>）。
 // 结果就是一堆几百 MB 的「未使用」镜像躺在列表里删不掉。
 //
+// ghcr.io 的 <none> 是另一类：按 digest 拉取的镜像没有 tag，docker 记为
+// <repo>@sha256:...（界面上显示成 <repo>:<none>）；更新时 ImageTag 把 :latest
+// 打给新镜像，旧镜像 tag 被转移后只剩这个无 tag 的 digest 引用，既不是
+// <none>:<none>（有 RepoDigests 不算 dangling），前缀又不在 hubURL 的加速站
+// 列表里，所以历次清理都漏掉它、越攒越多。这里把 ghcr.io / docker.io 也纳入，
+// 但只对「没有任何正常 tag」的镜像生效——用户手动拉来备用、带正常 tag 的
+// 镜像一律不碰，绝不强删。
+//
 // 安全性：keepID 是刚拉取的新镜像，无论有没有容器引用都不删；其余只删
 // 「无任何容器（含已停止）引用」的，正在用的版本永远不碰。
 func PurgeStaleHubImages(ctx context.Context, cli *client.Client, keepID string) {
-	hosts := make([]string, 0, 4)
+	hosts := make([]string, 0, 6)
 	for _, t := range hubcfg.Targets() {
 		h := t
 		if s, ok := strings.CutPrefix(t, "https://"); ok {
@@ -328,7 +337,11 @@ func PurgeStaleHubImages(ctx context.Context, cli *client.Client, keepID string)
 			hosts = append(hosts, h+"/")
 		}
 	}
-	if len(hosts) == 0 {
+	// 显式 registry（GHCR / Docker Hub）：按 digest 拉取后 tag 被转移，旧镜像
+	// 会以 <repo>:<none> 悬空残留，且不在 hubURL 的加速站列表里，历次清理漏掉。
+	// 这两类必须额外判「无任何正常 tag」，否则会误删用户手动拉来备用的镜像。
+	explicitRegistries := []string{"ghcr.io/", "docker.io/"}
+	if len(hosts) == 0 && len(explicitRegistries) == 0 {
 		return
 	}
 	keep := strings.TrimPrefix(keepID, "sha256:")
@@ -360,17 +373,43 @@ func PurgeStaleHubImages(ctx context.Context, cli *client.Client, keepID string)
 			continue
 		}
 		// RepoTags 只覆盖「仍带 tag」的引用；那些已经变成 <none> 的，只能从
-		// RepoDigests 看出它来自哪个加速站（形如 <站>/<repo>@sha256:...）。
-		// 两类都要看，否则 <站>/<repo>:<none> 这种会漏清。
+		// RepoDigests 看出它来自哪个仓库（形如 <host>/<repo>@sha256:...）。
+		// 两类都要看，否则 <站>/<repo>:<none> 和 <repo>:<none> 这种会漏清。
 		refs := make([]string, 0, len(im.RepoTags)+len(im.RepoDigests))
 		refs = append(refs, im.RepoTags...)
 		refs = append(refs, im.RepoDigests...)
+
+		// 是否还挂着「正常 tag」。正常 tag 一律不动（可能是用户手动拉来备用）；
+		// 只有 RepoTags 全空、或全是 <none>:<none> / xxx:<none> 的悬空镜像才清。
+		hasRealTag := false
+		for _, t := range im.RepoTags {
+			if t == "<none>:<none>" || strings.HasSuffix(t, ":<none>") {
+				continue
+			}
+			hasRealTag = true
+			break
+		}
+
 		hit := ""
 		for _, t := range refs {
+			// 加速站前缀（qqaazz/linkease 等）：沿用原逻辑，有引用即清。
 			for _, h := range hosts {
 				if strings.HasPrefix(t, h) {
 					hit = t
 					break
+				}
+			}
+			if hit != "" {
+				break
+			}
+			// 显式 registry（GHCR/Docker Hub）：仅当「无任何正常 tag」才清，
+			// 避免把用户手动拉来、带正常 tag 的镜像误删。
+			if !hasRealTag {
+				for _, h := range explicitRegistries {
+					if strings.HasPrefix(t, h) {
+						hit = t
+						break
+					}
 				}
 			}
 			if hit != "" {
@@ -381,14 +420,14 @@ func PurgeStaleHubImages(ctx context.Context, cli *client.Client, keepID string)
 			continue
 		}
 		if _, rerr := cli.ImageRemove(ctx, im.ID, image.RemoveOptions{Force: true, PruneChildren: true}); rerr != nil {
-			logx.Infof("warn: 清理旧版加速站镜像 %s 失败（忽略）: %v", short, rerr)
+			logx.Infof("warn: 清理旧版残留镜像 %s 失败（忽略）: %v", short, rerr)
 			continue
 		}
 		cleaned++
-		logx.Infof("已清理旧版加速站镜像: %s [%s]", short, hit)
+		logx.Infof("已清理旧版残留镜像: %s [%s]", short, hit)
 	}
 	if cleaned > 0 {
-		logx.Infof("旧版加速站镜像清理完成，共 %d 个", cleaned)
+		logx.Infof("旧版残留镜像清理完成，共 %d 个", cleaned)
 	}
 }
 '''
